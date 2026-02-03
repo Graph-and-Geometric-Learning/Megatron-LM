@@ -1,0 +1,136 @@
+# HELM Integration - Debug and Fixes Log
+
+This document tracks bugs encountered during HELM integration and their fixes.
+
+---
+
+## Issue #1: Tensor View Incompatibility in Attention Output
+
+**Date:** 2026-02-03
+**File:** `tests/unit_tests/models/test_lorentz_gpt_e2e.py`
+**Severity:** Runtime Error
+
+### Symptom
+
+```
+RuntimeError: view size is not compatible with input tensor's size and stride
+(at least one dimension spans across two contiguous subspaces). Use .reshape(...) instead.
+```
+
+### Root Cause
+
+In the `LorentzSelfAttention.forward()` method, after extracting space-like dimensions from the attention output, the tensor was non-contiguous due to slicing:
+
+```python
+# This creates a non-contiguous view
+attn_output_space = attn_output[..., 1:]  # Slicing makes it non-contiguous
+attn_output_space = attn_output_space.view(batch_size, seq_length, -1)  # FAILS
+```
+
+When you slice a tensor along the last dimension (`[..., 1:]`), PyTorch creates a view that is not contiguous in memory. The `view()` operation requires the tensor to be contiguous.
+
+### Fix
+
+Add `.contiguous()` before calling `view()`:
+
+```python
+attn_output_space = attn_output[..., 1:].contiguous()  # Make contiguous first
+attn_output_space = attn_output_space.view(batch_size, seq_length, -1)  # Now works
+```
+
+### Lesson Learned
+
+When working with Lorentz vectors where we frequently slice off the time coordinate (`x[..., 1:]`), always ensure contiguity before reshaping. This is a common pattern in our codebase:
+
+```python
+# Pattern: Extract space-like dims and reshape
+x_space = lorentz_tensor[..., 1:].contiguous()
+x_reshaped = x_space.view(new_shape)
+```
+
+---
+
+## Test Results Summary (2026-02-03)
+
+After fixing Issue #1, all end-to-end tests pass:
+
+| Test | Status | Notes |
+|------|--------|-------|
+| Forward Pass | ✓ PASS | Output shape correct (batch, seq, vocab) |
+| Backward Pass | ✓ PASS | All 47 parameters have gradients, no NaN/Inf |
+| Manifold Constraint | ✓ PASS | Max error < 1e-4 at all layers |
+| Training Step | ✓ PASS | 5 steps completed, loss stable (~6.98) |
+| Model Size | ✓ PASS | 3.68M params for test config |
+
+### Manifold Constraint Details
+
+All intermediate activations remain on the Lorentz manifold (⟨x,x⟩ₗ = -c):
+
+| Component | Max Error |
+|-----------|-----------|
+| Embedding | 0.000000 |
+| Layer 0 | 0.000002 |
+| Layer 1 | 0.000001 |
+| Layer 2 | 0.000002 |
+| Layer 3 | 0.000001 |
+| Final Norm | 0.000061 |
+
+The slightly higher error at final norm is expected due to accumulated numerical precision loss, but still well within acceptable tolerance (< 1e-4).
+
+---
+
+## Known Issues / TODOs
+
+### TODO #1: FlashAttention Compatibility
+
+**Status:** Not Started
+**Priority:** Medium
+
+The current `LorentzDotProductAttention` uses standard attention computation. FlashAttention cannot be directly used because:
+1. Hyperbolic attention scores use `2c + 2*cinner(Q,K)` instead of `Q @ K.T / sqrt(d)`
+2. Value aggregation uses Lorentzian centroid instead of weighted sum
+
+**Potential Solutions:**
+- Custom CUDA kernel for hyperbolic attention
+- Approximate with standard attention for large sequences (with accuracy tradeoff)
+
+### TODO #2: Gradient Clipping in Hyperbolic Space
+
+**Status:** Not Started
+**Priority:** Low
+
+Current implementation uses standard Euclidean gradient clipping. For true Riemannian optimization, gradients should be clipped in tangent space.
+
+### TODO #3: Mixed Precision (BF16) Validation
+
+**Status:** Not Tested
+**Priority:** High
+
+Need to validate numerical stability with BF16 precision. Hyperbolic operations (especially `arcosh`, `sqrt` for time reconstruction) may need careful handling to avoid precision loss.
+
+---
+
+## Testing Commands
+
+Run end-to-end test:
+```bash
+docker run --rm --gpus all \
+  --ipc=host \
+  -v "$(pwd):/workspace/megatron" \
+  -w /workspace/megatron \
+  nvcr.io/nvidia/pytorch:25.04-py3 \
+  python tests/unit_tests/models/test_lorentz_gpt_e2e.py
+```
+
+Run individual component tests:
+```bash
+# Manifold tests
+docker run --rm --gpus all \
+  -v "$(pwd):/workspace/megatron" \
+  nvcr.io/nvidia/pytorch:25.04-py3 \
+  python -c "
+import sys; sys.path.insert(0, '/workspace/megatron')
+from megatron.core.manifolds import Lorentz
+# ... test code
+"
+```

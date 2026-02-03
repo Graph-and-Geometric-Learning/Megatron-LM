@@ -26,7 +26,7 @@ Track progress of HELM (Hyperbolic Large Language Models) integration into Megat
 - [x] Create `LorentzHyperbolicConfig` dataclass (separate from TransformerConfig)
 - [x] Create `lorentz_layer_specs.py` - Layer specifications for hyperbolic GPT
 - [x] Create `lorentz_gpt_model.py` - Lorentz embeddings, output layer, model wrapper
-- [ ] End-to-end training test
+- [x] End-to-end training test (Qwen3-0.6B-like architecture)
 
 ### Phase 5: HELM-MiCE Integration (Future)
 - [ ] `lorentz_mla.py` - Multi-head Latent Attention
@@ -74,3 +74,14 @@ Track progress of HELM (Hyperbolic Large Language Models) integration into Megat
     - `LorentzGPTModelMixin`: Mixin for adding hyperbolic support to GPT models
     - `SimpleLorentzGPT`: Minimal test model demonstrating full pipeline
   - Verified: All components work, embeddings produce valid Lorentz vectors
+- **Phase 4 Complete**: End-to-end test with Qwen3-0.6B-like architecture
+  - `tests/unit_tests/models/test_lorentz_gpt_e2e.py` - Full E2E test suite
+  - `LorentzGPTQwen3`: Complete model with embedding, transformer layers, output
+  - `LorentzSelfAttention`: Self-attention with GQA support
+  - `LorentzTransformerLayer`: Full transformer layer (pre-norm style)
+  - Test results:
+    - Forward pass: ✓ (correct output shape)
+    - Backward pass: ✓ (all 47 params have gradients, no NaN/Inf)
+    - Manifold constraint: ✓ (max error < 1e-4 at all layers)
+    - Training step: ✓ (5 steps, loss stable ~6.98)
+  - Bug fix: Added `.contiguous()` before tensor view in attention (see DEBUG_AND_FIXES.md)
