@@ -34,9 +34,9 @@ Track progress of HELM (Hyperbolic Large Language Models) integration into Megat
 - [x] `lorentz_router.py` - Curvature-aware router
 - [x] `lorentz_experts.py` - Variable curvature experts
 
-### Phase 6: Optimizers & Training (Future)
-- [ ] `riemannian_adam.py` - Riemannian optimizer
-- [ ] Training script integration
+### Phase 6: Optimizers & Training
+- [x] `riemannian_adam.py` - Riemannian optimizer
+- [x] Training script integration (`pretrain_lorentz_gpt.py`)
 
 ---
 
@@ -104,3 +104,20 @@ Track progress of HELM (Hyperbolic Large Language Models) integration into Megat
     - Curvature transfer: `x * sqrt(c_expert / c_input)`
     - Load balancing via auxiliary loss or bias updates
   - Verified: Forward, backward pass work; outputs on manifold
+- **Phase 6 Complete**: Riemannian optimizer
+  - `megatron/core/optimizer/riemannian_adam.py` - Manifold-aware optimization
+    - `RiemannianAdam`: Full Riemannian Adam with exponential map and parallel transport
+    - `RiemannianSGD`: Simpler Riemannian SGD with momentum
+    - `DualOptimizer`: Wrapper for mixed Euclidean + Riemannian parameters
+    - `create_optimizer_for_lorentz_model()`: Factory (defaults to standard AdamW)
+  - Key insight: For most HELM models, **standard AdamW is correct**:
+    - Model weights (linear layers, embeddings) are Euclidean
+    - Manifold constraint on activations maintained by forward pass ops
+    - Riemannian optimizer only needed for learnable manifold anchor points
+  - RiemannianAdam features (when needed):
+    - Gradients projected to tangent space at current point
+    - Updates via exponential map (geodesic movement)
+    - Momentum parallel transported between iterations
+    - Periodic stabilization (re-projection to manifold)
+    - Mark params with `param.manifold_point = True` for Riemannian opt
+  - Verified: All tests pass, training stable with standard AdamW

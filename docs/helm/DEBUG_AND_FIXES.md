@@ -136,6 +136,58 @@ When passing tensors through multiple layers, be careful about dimension manipul
 
 ---
 
+## Issue #3: Riemannian Optimizer NaN with Regular Weights
+
+**Date:** 2026-02-03
+**File:** `megatron/core/optimizer/riemannian_adam.py`
+**Severity:** Design Issue (Fixed)
+
+### Symptom
+
+When applying `RiemannianAdam` to all model parameters:
+```
+Step 1: loss = 7.07
+Step 2: loss = nan
+Step 3: loss = nan
+```
+
+### Root Cause
+
+The initial implementation applied Riemannian optimization (exponential map, parallel transport) to ALL parameters, including linear layer weights. However:
+
+1. **Linear layer weights are NOT Lorentz vectors** - they are Euclidean matrices that transform vectors
+2. **Only activations flow on the manifold** - the forward pass maintains the constraint
+3. **Applying Lorentz inner product to weight matrices is meaningless** and causes numerical instability
+
+### Understanding
+
+In hyperbolic neural networks:
+- **Weights** (W_q, W_k, W_v, FFN weights): Euclidean matrices optimized with standard Adam
+- **Embeddings**: Can be Euclidean (projected to manifold) or manifold points
+- **Activations**: Flow on the manifold, maintained by projection operations
+- **Manifold constraint**: Enforced by forward pass (exp_map, projection, centroid)
+
+### Fix
+
+1. **Default to standard AdamW** in `create_optimizer_for_lorentz_model()`:
+   ```python
+   def create_optimizer_for_lorentz_model(..., use_riemannian=False):
+   ```
+
+2. **Use Riemannian optimization only for marked parameters**:
+   ```python
+   # Mark a parameter as a manifold point
+   param.manifold_point = True
+   ```
+
+3. **Updated `_is_lorentz_param`** to handle mixed parameter types gracefully
+
+### Lesson Learned
+
+**Standard AdamW is correct for HELM models**. Riemannian optimization is only needed for specialized use cases with learnable anchor points on the manifold. The manifold constraint on activations is maintained by forward pass operations, not by the optimizer.
+
+---
+
 ## Known Issues / TODOs
 
 ### TODO #1: FlashAttention Compatibility
