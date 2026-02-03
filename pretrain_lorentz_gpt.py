@@ -483,11 +483,15 @@ def train(args: TrainingArgs, config: LorentzGPTConfig):
     )
 
     # Mixed precision
-    scaler = torch.amp.GradScaler() if args.bf16 else None
+    # Note: GradScaler is only needed for fp16, not bf16
+    # BF16 has same exponent range as fp32, so no loss scaling needed
+    scaler = None
     autocast_dtype = torch.bfloat16 if args.bf16 else torch.float32
 
     # Gradient accumulation
-    grad_accum_steps = args.batch_size // (args.micro_batch_size * world_size)
+    grad_accum_steps = max(1, args.batch_size // (args.micro_batch_size * world_size))
+    if is_main:
+        print(f"Gradient accumulation steps: {grad_accum_steps}")
 
     # Training loop
     model.train()

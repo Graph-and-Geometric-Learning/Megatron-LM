@@ -727,6 +727,27 @@ class TransformerConfig(ModelParallelConfig):
     16 SMs can generally achieve good bandwidth."""
 
     ##################
+    # Hyperbolic Geometry (Lorentz MoE)
+    ##################
+    use_hyperbolic: bool = False
+    """Enable hyperbolic (Lorentz) geometry in the model."""
+
+    hyperbolic_curvature: float = 1.0
+    """Curvature parameter c for hyperbolic space. Negative curvature = -1/c."""
+
+    learnable_curvature: bool = False
+    """Make the curvature a learnable parameter."""
+
+    expert_curvature_min: float = 0.1
+    """Minimum curvature for per-expert curvature distribution (MiCE)."""
+
+    expert_curvature_max: float = 2.0
+    """Maximum curvature for per-expert curvature distribution (MiCE)."""
+
+    use_lorentz_moe: bool = False
+    """Use Lorentz MoE layer with per-expert curvature transfer (HELM-MiCE)."""
+
+    ##################
     # Context Parallel
     ##################
     cp_comm_type: Optional[Union[str, List[str]]] = None
