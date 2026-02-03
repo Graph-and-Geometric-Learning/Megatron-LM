@@ -28,10 +28,11 @@ Track progress of HELM (Hyperbolic Large Language Models) integration into Megat
 - [x] Create `lorentz_gpt_model.py` - Lorentz embeddings, output layer, model wrapper
 - [x] End-to-end training test (Qwen3-0.6B-like architecture)
 
-### Phase 5: HELM-MiCE Integration (Future)
-- [ ] `lorentz_mla.py` - Multi-head Latent Attention
-- [ ] `lorentz_moe.py` - Mixture of Curvature Experts
-- [ ] `lorentz_router.py` - Curvature-aware router
+### Phase 5: HELM-MiCE Integration
+- [ ] `lorentz_mla.py` - Multi-head Latent Attention (future)
+- [x] `lorentz_moe_layer.py` - Mixture of Curvature Experts
+- [x] `lorentz_router.py` - Curvature-aware router
+- [x] `lorentz_experts.py` - Variable curvature experts
 
 ### Phase 6: Optimizers & Training (Future)
 - [ ] `riemannian_adam.py` - Riemannian optimizer
@@ -85,3 +86,21 @@ Track progress of HELM (Hyperbolic Large Language Models) integration into Megat
     - Manifold constraint: ✓ (max error < 1e-4 at all layers)
     - Training step: ✓ (5 steps, loss stable ~6.98)
   - Bug fix: Added `.contiguous()` before tensor view in attention (see DEBUG_AND_FIXES.md)
+- **Phase 5 In Progress**: HELM-MiCE (Mixture of Curvature Experts)
+  - `megatron/core/transformer/moe/lorentz_router.py` - Curvature-aware routing
+    - `LorentzRouter`: Routes on space-like dimensions, top-k selection
+    - `LorentzAuxLossRouter`: With auxiliary loss for load balancing
+  - `megatron/core/transformer/moe/lorentz_experts.py` - Variable curvature experts
+    - `LorentzExpert`: Single expert with curvature transfer
+    - `LorentzExpertGroup`: Group with curvatures distributed across range
+    - `LorentzGroupedExperts`: Batched expert computation
+    - `LorentzSharedExpert`: Always-active shared expert
+  - `megatron/core/transformer/moe/lorentz_moe_layer.py` - Full MoE layer
+    - `LorentzMoEConfig`: Configuration dataclass
+    - `LorentzMoE`: Complete layer with router, experts, shared experts
+    - `LorentzMoEBlock`: MoE block with norm and residual
+  - Key features:
+    - Each expert operates in its own curvature (0.1 to 2.0 range)
+    - Curvature transfer: `x * sqrt(c_expert / c_input)`
+    - Load balancing via auxiliary loss or bias updates
+  - Verified: Forward, backward pass work; outputs on manifold

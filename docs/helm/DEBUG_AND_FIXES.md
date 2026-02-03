@@ -79,6 +79,63 @@ The slightly higher error at final norm is expected due to accumulated numerical
 
 ---
 
+## Issue #2: Double Unsqueeze in MoE Expert Weighting
+
+**Date:** 2026-02-03
+**Files:** `lorentz_experts.py`, `lorentz_moe_layer.py`
+**Severity:** Runtime Error
+
+### Symptom
+
+```
+RuntimeError: shape '[32, 2, 65]' is invalid for input of size 266240
+```
+
+### Root Cause
+
+In `LorentzMoE.forward()`, routing weights were passed with `.unsqueeze(-1)`:
+```python
+expert_output, _ = self.experts(
+    permuted_states,
+    tokens_per_expert,
+    permuted_weights.unsqueeze(-1),  # Shape: (64, 1)
+)
+```
+
+Then in `LorentzGroupedExperts.forward()`, another unsqueeze was applied:
+```python
+if permuted_probs is not None:
+    output = output * permuted_probs.unsqueeze(-1)  # Double unsqueeze!
+```
+
+This caused broadcasting from `(64, 65) * (64, 1, 1)` → `(64, 64, 65)` instead of element-wise multiplication.
+
+### Fix
+
+1. Remove extra unsqueeze in call site:
+```python
+expert_output, _ = self.experts(
+    permuted_states,
+    tokens_per_expert,
+    permuted_weights,  # Shape: (64,) - no unsqueeze
+)
+```
+
+2. Handle both 1D and 2D inputs in `LorentzGroupedExperts.forward()`:
+```python
+if permuted_probs is not None:
+    if permuted_probs.dim() == 1:
+        output = output * permuted_probs.unsqueeze(-1)
+    else:
+        output = output * permuted_probs
+```
+
+### Lesson Learned
+
+When passing tensors through multiple layers, be careful about dimension manipulation. Use explicit shape comments and assertions to catch broadcasting errors early.
+
+---
+
 ## Known Issues / TODOs
 
 ### TODO #1: FlashAttention Compatibility
