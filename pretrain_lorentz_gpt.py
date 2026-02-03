@@ -29,6 +29,7 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Optional, Tuple, Iterator
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -360,9 +361,6 @@ class TokenizedDataset(Dataset):
 class TrainingArgs:
     """Training arguments."""
 
-    # Model
-    config: str = "test"
-
     # Data
     data_path: Optional[str] = None
     num_samples: int = 10000
@@ -420,7 +418,7 @@ def get_lr(step: int, args: TrainingArgs) -> float:
     return args.min_lr + 0.5 * (args.lr - args.min_lr) * (1 + math.cos(math.pi * progress))
 
 
-def train(args: TrainingArgs):
+def train(args: TrainingArgs, config: LorentzGPTConfig):
     """Main training function."""
 
     # Setup distributed
@@ -432,12 +430,6 @@ def train(args: TrainingArgs):
         print("=" * 60)
         print("Lorentz GPT Training")
         print("=" * 60)
-
-    # Get model config
-    if args.config in CONFIGS:
-        config = CONFIGS[args.config]
-    else:
-        raise ValueError(f"Unknown config: {args.config}. Available: {list(CONFIGS.keys())}")
 
     if is_main:
         print(f"Config: {config.name}")
@@ -601,9 +593,25 @@ def save_checkpoint(model, optimizer, step, args, config):
 def main():
     parser = argparse.ArgumentParser(description="Pretrain Lorentz GPT")
 
-    # Model
-    parser.add_argument("--config", type=str, default="test",
-                        choices=list(CONFIGS.keys()), help="Model configuration")
+    # Model Architecture
+    parser.add_argument("--hidden-size", type=int, default=1024,
+                        help="Hidden size")
+    parser.add_argument("--num-layers", type=int, default=28,
+                        help="Number of transformer layers")
+    parser.add_argument("--num-attention-heads", type=int, default=16,
+                        help="Number of attention heads")
+    parser.add_argument("--num-kv-heads", type=int, default=8,
+                        help="Number of KV heads for GQA")
+    parser.add_argument("--ffn-hidden-size", type=int, default=3072,
+                        help="FFN hidden size")
+    parser.add_argument("--vocab-size", type=int, default=151936,
+                        help="Vocabulary size")
+    parser.add_argument("--seq-length", type=int, default=2048,
+                        help="Sequence length")
+
+    # Hyperbolic Configuration
+    parser.add_argument("--curvature", type=float, default=1.0,
+                        help="Hyperbolic curvature")
 
     # Data
     parser.add_argument("--data-path", type=str, default=None,
@@ -647,9 +655,21 @@ def main():
 
     args = parser.parse_args()
 
+    # Create model config from command-line args
+    config = LorentzGPTConfig(
+        name="lorentz-gpt",
+        hidden_size=args.hidden_size,
+        num_layers=args.num_layers,
+        num_attention_heads=args.num_attention_heads,
+        num_kv_heads=args.num_kv_heads,
+        ffn_hidden_size=args.ffn_hidden_size,
+        vocab_size=args.vocab_size,
+        max_seq_length=args.seq_length,
+        curvature=args.curvature,
+    )
+
     # Convert to TrainingArgs
     training_args = TrainingArgs(
-        config=args.config,
         data_path=args.data_path,
         num_samples=args.num_samples,
         batch_size=args.batch_size,
@@ -666,7 +686,7 @@ def main():
         checkpoint_dir=args.checkpoint_dir,
     )
 
-    train(training_args)
+    train(training_args, config)
 
 
 if __name__ == "__main__":
