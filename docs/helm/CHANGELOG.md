@@ -11,15 +11,16 @@ Track progress of HELM (Hyperbolic Large Language Models) integration into Megat
 - [x] Unit tests for manifold operations (Docker verified)
 
 ### Phase 2: Tensor Parallel Lorentz Layers
-- [ ] Create `lorentz_layers.py` with TP support
-- [ ] `LorentzColumnParallelLinear`
-- [ ] `LorentzRowParallelLinear`
+- [x] Create `lorentz_layers.py` with TP support
+- [x] `LorentzLinear` - Non-parallel Lorentz linear layer
+- [x] `LorentzColumnParallelLinear` - Partitions output space-like dims
+- [x] `LorentzRowParallelLinear` - Partitions input space-like dims, reduces output
 
 ### Phase 3: Transformer Components
-- [ ] `lorentz_norm.py` - LorentzRMSNorm
-- [ ] `lorentz_residual.py` - LResNet
-- [ ] `lorentz_attention.py` - LorentzDotProductAttention
-- [ ] `lorentz_mlp.py` - LorentzMLP
+- [x] `lorentz_norm.py` - LorentzRMSNorm, LorentzLayerNorm, LorentzActivation, LorentzDropout
+- [x] `lorentz_residual.py` - LorentzResidual (LResNet), LorentzBiasDropoutAdd
+- [x] `lorentz_attention.py` - LorentzDotProductAttention, LorentzCoreAttention
+- [x] `lorentz_mlp.py` - LorentzMLP (SwiGLU), LorentzFeedForward, LorentzParallelMLP
 
 ### Phase 4: HELM-D Integration
 - [ ] Add hyperbolic config fields to TransformerConfig
@@ -49,3 +50,15 @@ Track progress of HELM (Hyperbolic Large Language Models) integration into Megat
   - `megatron/core/manifolds/lorentz.py` - Lorentz manifold class (~300 lines)
   - `megatron/core/manifolds/lorentz_math.py` - Hyperbolic math ops (~450 lines)
   - Verified: projection, inner product, attention scores, centroid all working
+- **Phase 2 Complete**: Created TP-compatible Lorentz linear layers
+  - `megatron/core/tensor_parallel/lorentz_layers.py` (~400 lines)
+  - `LorentzLinear`: Non-parallel base layer
+  - `LorentzColumnParallelLinear`: Output partitioned across TP ranks
+  - `LorentzRowParallelLinear`: Input partitioned, output reduced
+  - Key design: Time coord never partitioned, reconstructed after comm ops
+- **Phase 3 Complete**: Ported transformer components
+  - `megatron/core/transformer/lorentz_norm.py` - Normalization layers
+  - `megatron/core/transformer/lorentz_residual.py` - Residual connections
+  - `megatron/core/transformer/lorentz_attention.py` - Hyperbolic attention
+  - `megatron/core/transformer/lorentz_mlp.py` - MLP with SwiGLU
+  - All outputs verified on manifold (⟨x,x⟩ₗ = -c)
