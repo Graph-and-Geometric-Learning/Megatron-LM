@@ -23,9 +23,9 @@ Track progress of HELM (Hyperbolic Large Language Models) integration into Megat
 - [x] `lorentz_mlp.py` - LorentzMLP (SwiGLU), LorentzFeedForward, LorentzParallelMLP
 
 ### Phase 4: HELM-D Integration
-- [ ] Add hyperbolic config fields to TransformerConfig
-- [ ] Create `lorentz_layer_specs.py`
-- [ ] Create `lorentz_gpt_model.py`
+- [x] Create `LorentzHyperbolicConfig` dataclass (separate from TransformerConfig)
+- [x] Create `lorentz_layer_specs.py` - Layer specifications for hyperbolic GPT
+- [x] Create `lorentz_gpt_model.py` - Lorentz embeddings, output layer, model wrapper
 - [ ] End-to-end training test
 
 ### Phase 5: HELM-MiCE Integration (Future)
@@ -62,3 +62,15 @@ Track progress of HELM (Hyperbolic Large Language Models) integration into Megat
   - `megatron/core/transformer/lorentz_attention.py` - Hyperbolic attention
   - `megatron/core/transformer/lorentz_mlp.py` - MLP with SwiGLU
   - All outputs verified on manifold (⟨x,x⟩ₗ = -c)
+- **Phase 4 In Progress**: HELM-D integration
+  - `megatron/core/models/gpt/lorentz_layer_specs.py` - Layer specifications
+    - `LorentzHyperbolicConfig`: Dataclass for hyperbolic settings (curvature, model_type, etc.)
+    - `get_lorentz_gpt_layer_spec()`: Factory for dense/MiCE layer specs
+    - `get_lorentz_gpt_layer_spec_dense()`: Full dense hyperbolic layer spec
+    - `LorentzLayerSpecProvider`: Provider class for modular spec creation
+  - `megatron/core/models/gpt/lorentz_gpt_model.py` - Model components
+    - `LorentzEmbedding`: Projects token embeddings to Lorentz manifold
+    - `LorentzOutputLayer`: Projects from Lorentz space to vocabulary logits
+    - `LorentzGPTModelMixin`: Mixin for adding hyperbolic support to GPT models
+    - `SimpleLorentzGPT`: Minimal test model demonstrating full pipeline
+  - Verified: All components work, embeddings produce valid Lorentz vectors
