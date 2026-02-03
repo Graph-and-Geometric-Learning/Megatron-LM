@@ -47,6 +47,7 @@ class LorentzRMSNorm(nn.Module):
         self.dim = dim
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
+        self._logged_first_call = False
 
     def forward(
         self,
@@ -65,6 +66,11 @@ class LorentzRMSNorm(nn.Module):
         Returns:
             Normalized tensor on manifold or space-like only
         """
+        # Log first call to verify Lorentz layer is being used
+        if not self._logged_first_call:
+            print(f"[LORENTZ] LorentzRMSNorm forward (dim={self.dim}, c={self.manifold.c.item():.4f})")
+            self._logged_first_call = True
+
         # Extract space-like dimensions
         if space_only:
             x_space = x

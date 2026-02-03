@@ -97,6 +97,7 @@ class LorentzMLP(nn.Module):
             input_includes_time=True,
             return_space=False,  # Output full Lorentz
         )
+        self._logged_first_call = False
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -108,6 +109,11 @@ class LorentzMLP(nn.Module):
         Returns:
             Output tensor, shape (..., hidden_size+1) - full Lorentz vector
         """
+        # Log first call to verify Lorentz MLP is being used
+        if not self._logged_first_call:
+            print(f"[LORENTZ] LorentzMLP forward (hidden={self.hidden_size}, ffn={self.ffn_hidden_size}, c={self.manifold.c.item():.4f})")
+            self._logged_first_call = True
+
         # Gate path: SiLU activation on space-like
         gate_space = self.activation(self.w1(x))  # (..., ffn_hidden)
 

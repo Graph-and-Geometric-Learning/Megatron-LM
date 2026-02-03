@@ -67,6 +67,7 @@ class LorentzDotProductAttention(nn.Module):
 
         # Attention dropout
         self.attention_dropout = nn.Dropout(attention_dropout) if attention_dropout > 0 else None
+        self._logged_first_call = False
 
     def forward(
         self,
@@ -90,6 +91,11 @@ class LorentzDotProductAttention(nn.Module):
             output: Attention output, shape (batch, heads, seq_q, dim_per_head+1)
             attention_weights: Optional attention weights
         """
+        # Log first call to verify Lorentz attention is being used
+        if not self._logged_first_call:
+            print(f"[LORENTZ] LorentzDotProductAttention forward (layer={self.layer_number}, heads={self.num_attention_heads}, c={self.manifold.c.item():.4f})")
+            self._logged_first_call = True
+
         # Query, key, value should be full Lorentz vectors (with time coordinate)
         # Compute hyperbolic attention scores using Lorentzian inner product
         # cinner computes: -q₀k₀ + Σqᵢkᵢ for all pairs
