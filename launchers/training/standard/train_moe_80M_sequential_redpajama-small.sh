@@ -1,22 +1,18 @@
 #!/bin/bash
 # =============================================================================
-# Lorentz MoE GPT: TEGroupedMLP Backend (Recommended)
+# Standard Megatron MoE GPT 80M: SequentialMLP Backend
 # =============================================================================
-# Lorentz MoE training with TransformerEngine's efficient grouped linear.
-# This is the recommended approach for production Lorentz MoE training.
+# Standard (non-hyperbolic) MoE training with SequentialMLP.
+# Baseline for comparison with Lorentz MoE.
 #
-# Expert Type: LorentzTEGroupedMLP
-#   - True Lorentz geometry via tangent space approximation
-#   - Uses TransformerEngine's efficient grouped linear operations
-#   - Supports FP8 training
-#   - Per-expert curvatures distributed across range
+# Expert Type: SequentialMLP
+#   - No TE dependency (fallback, always works)
+#   - Euclidean geometry (standard)
 #
-# Model: ~100M total parameters (small test model)
-#   - 12 layers, hidden_size 512
-#   - 4 routed experts + 1 shared expert
-#   - Top-2 routing per token
-#   - MoE layer every 2nd layer
-#   - Per-expert curvature (0.1 to 2.0)
+# Model: ~80M total parameters
+#   - 4 layers, hidden_size 256, ffn 512
+#   - 4 routed experts
+#   - Top-2 routing, MoE every 2nd layer
 # =============================================================================
 
 set -e
@@ -40,10 +36,10 @@ fi
 # =============================================================================
 # Export Config for Base Script
 # =============================================================================
-export MODEL_NAME="lorentz-moe-te-grouped"
-export EXPERT_TYPE="LorentzTEGroupedMLP"
+export MODEL_NAME="standard-moe-80M-sequential"
+export EXPERT_TYPE="SequentialMLP"
 
-# Model Architecture (Tiny test model for memory-constrained environments)
+# Model Architecture (~80M params)
 export MODEL_ARGS=(
     --num-layers 4
     --hidden-size 256
@@ -65,35 +61,20 @@ export MODEL_ARGS=(
 )
 
 # MoE Configuration (Megatron-style)
-# --moe-grouped-gemm enables TEGroupedMLP (without --moe-use-legacy-grouped-gemm)
+# NOTE: No --moe-grouped-gemm flag -> uses SequentialMLP (default)
 export MOE_ARGS=(
     --num-experts 4
-    --moe-shared-expert-intermediate-size 512
     --moe-router-topk 2
     --moe-layer-freq 2
     --moe-aux-loss-coeff 0.01
     --moe-token-dispatcher-type allgather
-    --moe-grouped-gemm
-)
-
-# Hyperbolic Configuration (Lorentz-specific)
-export HYPERBOLIC_ARGS=(
-    --use-lorentz-moe
-    --use-hyperbolic
-    --hyperbolic-curvature 1.0
-    --expert-curvature-min 0.1
-    --expert-curvature-max 2.0
 )
 
 # Export settings for display
 export NUM_EXPERTS=4
-export NUM_SHARED_EXPERTS=1
 export MOE_ROUTER_TOPK=2
 export MOE_LAYER_FREQ=2
 export MOE_AUX_LOSS_COEFF=0.01
-export HYPERBOLIC_CURVATURE=1.0
-export EXPERT_CURVATURE_MIN=0.1
-export EXPERT_CURVATURE_MAX=2.0
 
 # Training Hyperparameters
 export BATCH_SIZE=4

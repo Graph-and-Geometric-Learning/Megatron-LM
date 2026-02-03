@@ -1,21 +1,19 @@
 #!/bin/bash
 # =============================================================================
-# Lorentz MoE GPT: Small Test Model with RedPajama-Small (HELM-MiCE)
+# Lorentz MoE GPT 250M: SequentialMLP Backend
 # =============================================================================
-# Single-node MoE training with RedPajama small dataset.
-# Uses Megatron's full pretrain infrastructure.
+# Lorentz MoE training with LorentzSequentialMLP (true Lorentz per expert).
 #
-# Model: ~100M total parameters (smaller for testing)
-#   - 12 layers, hidden_size 512
+# Expert Type: LorentzSequentialMLP
+#   - True Lorentz geometry with LorentzMLP per expert
+#   - No TE dependency (fallback, always works)
+#   - Per-expert curvatures distributed across range
+#
+# Model: ~250M total parameters
+#   - 12 layers, hidden_size 512, ffn 1536
 #   - 4 routed experts + 1 shared expert
-#   - Top-2 routing per token
+#   - Top-2 routing, MoE every 2nd layer
 #   - Per-expert curvature (0.1 to 2.0)
-#   - MoE layer every 2nd layer
-#
-# Key Hyperbolic Features:
-#   - LorentzTopKRouter: Routes via Lorentz inner product
-#   - LorentzSequentialMLP: True Lorentz operations per expert
-#   - LorentzSharedExpertMLP: True Lorentz at global curvature
 # =============================================================================
 
 set -e
@@ -39,9 +37,9 @@ fi
 # =============================================================================
 # Export Config for Base Script
 # =============================================================================
-export MODEL_NAME="lorentz-moe-small-test"
+export MODEL_NAME="lorentz-moe-250M-sequential"
 
-# Model Architecture (Small test model) - Megatron args
+# Model Architecture (~250M params)
 export MODEL_ARGS=(
     --num-layers 12
     --hidden-size 512

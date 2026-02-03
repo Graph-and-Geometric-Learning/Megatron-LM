@@ -1,20 +1,18 @@
 #!/bin/bash
 # =============================================================================
-# Standard Megatron MoE GPT: SequentialMLP (Baseline)
+# Standard Megatron MoE GPT 80M: TEGroupedMLP Backend
 # =============================================================================
-# Test standard Megatron MoE with SequentialMLP expert type.
-# This is the default expert type that always works without extra packages.
+# Standard (non-hyperbolic) MoE training with TEGroupedMLP.
+# Baseline for comparison with Lorentz MoE.
 #
-# Expert Type: SequentialMLP
-#   - No extra packages required
-#   - Sequential processing of experts
-#   - Fully functional baseline
+# Expert Type: TEGroupedMLP
+#   - TransformerEngine's efficient grouped linear
+#   - Euclidean geometry (standard)
 #
-# Model: ~100M total parameters (small test model)
-#   - 12 layers, hidden_size 512
+# Model: ~80M total parameters
+#   - 4 layers, hidden_size 256, ffn 512
 #   - 4 routed experts
-#   - Top-2 routing per token
-#   - MoE layer every 2nd layer
+#   - Top-2 routing, MoE every 2nd layer
 # =============================================================================
 
 set -e
@@ -38,10 +36,10 @@ fi
 # =============================================================================
 # Export Config for Base Script
 # =============================================================================
-export MODEL_NAME="standard-moe-sequential"
-export EXPERT_TYPE="SequentialMLP"
+export MODEL_NAME="standard-moe-80M-te"
+export EXPERT_TYPE="TEGroupedMLP"
 
-# Model Architecture (Tiny test model for memory-constrained environments)
+# Model Architecture (~80M params)
 export MODEL_ARGS=(
     --num-layers 4
     --hidden-size 256
@@ -63,13 +61,14 @@ export MODEL_ARGS=(
 )
 
 # MoE Configuration (Megatron-style)
-# NOTE: No --moe-grouped-gemm flag -> uses SequentialMLP (default)
+# --moe-grouped-gemm (without --moe-use-legacy-grouped-gemm) -> uses TEGroupedMLP
 export MOE_ARGS=(
     --num-experts 4
     --moe-router-topk 2
     --moe-layer-freq 2
     --moe-aux-loss-coeff 0.01
     --moe-token-dispatcher-type allgather
+    --moe-grouped-gemm
 )
 
 # Export settings for display
