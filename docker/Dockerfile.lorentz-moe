@@ -1,0 +1,47 @@
+# =============================================================================
+# Dockerfile for Lorentz MoE Training
+# =============================================================================
+# Based on NGC PyTorch container with additional dependencies pre-installed.
+# This avoids runtime pip installs which don't work well with Apptainer.
+#
+# Build:
+#   docker build -f docker/Dockerfile.lorentz-moe -t lorentz-moe:25.04 .
+#
+# Convert to Apptainer:
+#   apptainer build lorentz-moe_25.04.sif docker-daemon://lorentz-moe:25.04
+# =============================================================================
+
+FROM nvcr.io/nvidia/pytorch:25.04-py3
+
+LABEL maintainer="Lorentz MoE Training"
+LABEL description="NGC PyTorch with Lorentz MoE dependencies"
+
+# Set environment variables
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+# Install additional system packages if needed
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    htop \
+    tmux \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python dependencies
+# Note: TransformerEngine is already included in NGC PyTorch 25.04
+RUN pip install --no-cache-dir \
+    transformers \
+    wandb \
+    tensorboard \
+    && pip cache purge
+
+# Verify key packages
+RUN python -c "import torch; print(f'PyTorch: {torch.__version__}')" && \
+    python -c "import transformer_engine; print(f'TransformerEngine: {transformer_engine.__version__}')" && \
+    python -c "import transformers; print(f'Transformers: {transformers.__version__}')"
+
+# Set working directory
+WORKDIR /workspace
+
+# Default command
+CMD ["/bin/bash"]
