@@ -344,11 +344,11 @@ if __name__ == "__main__":
     pretrain, store = inprocess_restart.maybe_wrap_for_inprocess_restart(pretrain)
 
     # Wrapper that selects builder based on --use-lorentz-moe flag at runtime
-    def gpt_builder_lorentz(args, pre_process, post_process, vp_stage=None, config=None):
+    def gpt_builder_lorentz(args, pre_process, post_process, vp_stage=None, config=None, **kwargs):
         if getattr(args, 'use_lorentz_moe', False):
-            return gpt_builder_lorentz_moe(args, pre_process, post_process, vp_stage, config)
+            return gpt_builder_lorentz_moe(args, pre_process, post_process, vp_stage, config, **kwargs)
         else:
-            return gpt_builder_lorentz_dense(args, pre_process, post_process, vp_stage, config)
+            return gpt_builder_lorentz_dense(args, pre_process, post_process, vp_stage, config, **kwargs)
 
     pretrain(
         train_valid_test_datasets_provider,
