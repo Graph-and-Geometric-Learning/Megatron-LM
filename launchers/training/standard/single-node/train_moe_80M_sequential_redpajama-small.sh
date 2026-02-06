@@ -1,19 +1,18 @@
 #!/bin/bash
 # =============================================================================
-# Lorentz MoE GPT 250M: SequentialMLP Backend
+# Standard Megatron MoE GPT 80M: SequentialMLP Backend
 # =============================================================================
-# Lorentz MoE training with LorentzSequentialMLP (true Lorentz per expert).
+# Standard (non-hyperbolic) MoE training with SequentialMLP.
+# Baseline for comparison with Lorentz MoE.
 #
-# Expert Type: LorentzSequentialMLP
-#   - True Lorentz geometry with LorentzMLP per expert
+# Expert Type: SequentialMLP
 #   - No TE dependency (fallback, always works)
-#   - Per-expert curvatures distributed across range
+#   - Euclidean geometry (standard)
 #
-# Model: ~250M total parameters
-#   - 12 layers, hidden_size 512, ffn 1536
-#   - 4 routed experts + 1 shared expert
+# Model: ~80M total parameters
+#   - 4 layers, hidden_size 256, ffn 512
+#   - 4 routed experts
 #   - Top-2 routing, MoE every 2nd layer
-#   - Per-expert curvature (0.1 to 2.0)
 # =============================================================================
 
 set -e
@@ -37,18 +36,19 @@ fi
 # =============================================================================
 # Export Config for Base Script
 # =============================================================================
-export MODEL_NAME="lorentz-moe-250M-sequential"
+export MODEL_NAME="standard-moe-80M-sequential"
+export EXPERT_TYPE="SequentialMLP"
 
-# Model Architecture (~250M params)
+# Model Architecture (~80M params)
 export MODEL_ARGS=(
-    --num-layers 12
-    --hidden-size 512
-    --num-attention-heads 8
+    --num-layers 4
+    --hidden-size 256
+    --num-attention-heads 4
     --group-query-attention
-    --num-query-groups 4
-    --ffn-hidden-size 1536
-    --seq-length 512
-    --max-position-embeddings 512
+    --num-query-groups 2
+    --ffn-hidden-size 512
+    --seq-length 256
+    --max-position-embeddings 256
     --position-embedding-type rope
     --normalization RMSNorm
     --swiglu
@@ -61,37 +61,24 @@ export MODEL_ARGS=(
 )
 
 # MoE Configuration (Megatron-style)
+# NOTE: No --moe-grouped-gemm flag -> uses SequentialMLP (default)
 export MOE_ARGS=(
     --num-experts 4
-    --moe-shared-expert-intermediate-size 1536
     --moe-router-topk 2
     --moe-layer-freq 2
     --moe-aux-loss-coeff 0.01
     --moe-token-dispatcher-type allgather
 )
 
-# Hyperbolic Configuration (Lorentz-specific)
-export HYPERBOLIC_ARGS=(
-    --use-lorentz-moe
-    --use-hyperbolic
-    --hyperbolic-curvature 1.0
-    --expert-curvature-min 0.1
-    --expert-curvature-max 2.0
-)
-
 # Export settings for display
 export NUM_EXPERTS=4
-export NUM_SHARED_EXPERTS=1
 export MOE_ROUTER_TOPK=2
 export MOE_LAYER_FREQ=2
 export MOE_AUX_LOSS_COEFF=0.01
-export HYPERBOLIC_CURVATURE=1.0
-export EXPERT_CURVATURE_MIN=0.1
-export EXPERT_CURVATURE_MAX=2.0
 
 # Training Hyperparameters
-export BATCH_SIZE=16
-export MICRO_BATCH_SIZE=2
+export BATCH_SIZE=4
+export MICRO_BATCH_SIZE=1
 export LR=3e-4
 export MIN_LR=3e-5
 export MAX_STEPS=1000
@@ -110,4 +97,4 @@ export EP=1
 # Run
 # =============================================================================
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "${SCRIPT_DIR}/_train_moe_base_docker.sh"
+source "${SCRIPT_DIR}/../base/_train_moe_base_docker.sh"

@@ -30,7 +30,7 @@ fi
 # =============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-MEGATRON_DIR="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+MEGATRON_DIR="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
 
 CHECKPOINT_DIR=${CHECKPOINT_DIR:-"${MEGATRON_DIR}/checkpoints/${MODEL_NAME}"}
 mkdir -p "$CHECKPOINT_DIR"

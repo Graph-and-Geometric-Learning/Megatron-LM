@@ -98,4 +98,4 @@ export EP=1
 # Run
 # =============================================================================
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "${SCRIPT_DIR}/_train_moe_base_docker.sh"
+source "${SCRIPT_DIR}/../base/_train_moe_base_docker.sh"

@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# Base Training Script: Lorentz MoE GPT (HELM-MiCE) - Docker
+# Base Training Script: Lorentz MoE GPT (HELM-MiCE) - Slurm Multi-Node
 # =============================================================================
 # This is the base script - do not run directly.
 # Use the config-specific launcher scripts.
@@ -9,15 +9,26 @@
 # - Megatron's DistributedDataParallel (NOT PyTorch DDP)
 # - Megatron's distributed optimizer
 # - Expert parallelism via Megatron's MoE infrastructure
+# - Slurm for multi-node coordination
+# - Apptainer for containerized execution
 #
 # Expected environment variables from launcher:
 #   MODEL_NAME        - Name for checkpoints
-#   MODEL_ARGS        - Model architecture arguments
-#   MOE_ARGS          - MoE configuration arguments
-#   HYPERBOLIC_ARGS   - Hyperbolic geometry arguments
+#   MODEL_ARGS_STR    - Model architecture arguments (string, not array)
+#   MOE_ARGS_STR      - MoE configuration arguments (string, not array)
+#   HYPERBOLIC_ARGS_STR - Hyperbolic geometry arguments (string, not array)
 #   DATA_PATH         - Path to data inside container
-#   DOCKER_DATA_MOUNT - Docker mount for data directory
+#   HOST_DATA_DIR     - Host path to data directory
 #   BATCH_SIZE, MICRO_BATCH_SIZE, LR, MAX_STEPS, etc.
+#
+# Note: Use _STR string variables instead of arrays because bash arrays
+# cannot be exported across process boundaries (e.g., via srun).
+#
+# Slurm-specific variables:
+#   SLURM_JOB_NODELIST   - Set by Slurm
+#   SLURM_NNODES         - Set by Slurm
+#   SLURM_NODEID         - Set by Slurm
+#   SLURM_PROCID         - Set by Slurm
 # =============================================================================
 
 set -e
@@ -36,29 +47,43 @@ fi
 # =============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-MEGATRON_DIR="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+MEGATRON_DIR="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
 
 CHECKPOINT_DIR=${CHECKPOINT_DIR:-"${MEGATRON_DIR}/checkpoints/${MODEL_NAME}"}
 TENSORBOARD_DIR=${TENSORBOARD_DIR:-"${MEGATRON_DIR}/tensorboard/${MODEL_NAME}"}
 mkdir -p "$CHECKPOINT_DIR" "$TENSORBOARD_DIR"
 
 # =============================================================================
-# GPU Configuration
+# Slurm/GPU Configuration
 # =============================================================================
 
-GPUS_PER_NODE=${GPUS_PER_NODE:-$(nvidia-smi -L 2>/dev/null | wc -l || echo 1)}
-NUM_NODES=${NUM_NODES:-1}
-NODE_RANK=${NODE_RANK:-0}
-MASTER_ADDR=${MASTER_ADDR:-localhost}
+# Use Slurm environment variables
+NUM_NODES=${SLURM_NNODES:-${NUM_NODES:-1}}
+NODE_RANK=${SLURM_NODEID:-${NODE_RANK:-0}}
+
+# Get master address from Slurm nodelist (first node)
+if [ -n "$SLURM_JOB_NODELIST" ]; then
+    MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
+else
+    MASTER_ADDR=${MASTER_ADDR:-localhost}
+fi
 MASTER_PORT=${MASTER_PORT:-29500}
 
+GPUS_PER_NODE=${GPUS_PER_NODE:-$(nvidia-smi -L 2>/dev/null | wc -l || echo 8)}
 WORLD_SIZE=$((GPUS_PER_NODE * NUM_NODES))
 
 # =============================================================================
-# Docker Configuration
+# Apptainer Configuration
 # =============================================================================
 
-DOCKER_IMAGE=${DOCKER_IMAGE:-"nvcr.io/nvidia/pytorch:25.04-py3"}
+APPTAINER_IMAGE=${APPTAINER_IMAGE:-"${HOME}/images/lorentz-moe_25.04.sif"}
+
+# Check if image exists
+if [[ ! -f "${APPTAINER_IMAGE}" ]]; then
+    echo "ERROR: Apptainer image not found: ${APPTAINER_IMAGE}"
+    echo "Run: ./launchers/setup/build_lorentz_moe_image.sh"
+    exit 1
+fi
 
 # =============================================================================
 # Parallelism Configuration (Megatron-style)
@@ -116,16 +141,17 @@ TRAINING_ARGS=(
 
     # Use Megatron's distributed optimizer
     --use-distributed-optimizer
-
-    # Use local transformer implementation for Lorentz components
-    --transformer-impl local
 )
 
 # Add data path if provided, otherwise use mock data
 if [ -n "$DATA_PATH" ]; then
+    # Create writable cache directory for dataset indices
+    DATA_CACHE_DIR="${MEGATRON_DIR}/data_cache/${MODEL_NAME}"
+    mkdir -p "$DATA_CACHE_DIR"
     TRAINING_ARGS+=(
         --data-path "$DATA_PATH"
         --split "949,50,1"
+        --data-cache-path "$DATA_CACHE_DIR"
     )
 else
     TRAINING_ARGS+=(
@@ -139,17 +165,20 @@ fi
 
 echo "=============================================="
 echo "Lorentz MoE GPT Training (HELM-MiCE)"
-echo "Full Megatron Integration"
+echo "Slurm Multi-Node Mode"
 echo "=============================================="
 echo "Model: $MODEL_NAME"
 echo "Data: ${DATA_PATH:-'mock data'}"
-echo "GPUs: $GPUS_PER_NODE x $NUM_NODES nodes = $WORLD_SIZE total"
+echo "Nodes: $NUM_NODES (this node: $NODE_RANK)"
+echo "Master: $MASTER_ADDR:$MASTER_PORT"
+echo "GPUs per node: $GPUS_PER_NODE"
+echo "Total GPUs: $WORLD_SIZE"
 echo "Parallelism: TP=$TP, PP=$PP, EP=$EP"
 echo "Batch: ${GLOBAL_BATCH_SIZE} global (micro: ${MICRO_BATCH_SIZE:-1})"
 echo "Steps: ${MAX_STEPS:-1000} (warmup: ${WARMUP_STEPS:-100})"
 echo "LR: ${LR:-3e-4} -> ${MIN_LR:-3e-5}"
 echo "Checkpoint: $CHECKPOINT_DIR"
-echo "Docker: $DOCKER_IMAGE"
+echo "Apptainer: $APPTAINER_IMAGE"
 echo "=============================================="
 echo "MoE Settings:"
 echo "  Experts: ${NUM_EXPERTS:-8}"
@@ -164,41 +193,43 @@ echo "  Expert curvature range: [${EXPERT_CURVATURE_MIN:-0.1}, ${EXPERT_CURVATUR
 echo "=============================================="
 
 # =============================================================================
-# Run Training in Docker
+# Run Training in Apptainer (launched by srun)
 # =============================================================================
 
-# Combine all arguments into a single string for passing to docker
-ALL_ARGS="${MODEL_ARGS[*]} ${MOE_ARGS[*]} ${HYPERBOLIC_ARGS[*]} ${TRAINING_ARGS[*]}"
+# Combine all arguments into a single string
+# Use _STR versions (strings) for args passed via srun, TRAINING_ARGS is local array
+ALL_ARGS="${MODEL_ARGS_STR} ${MOE_ARGS_STR} ${HYPERBOLIC_ARGS_STR} ${TRAINING_ARGS[*]}"
 
-docker run --rm \
-    --gpus all \
-    --ipc=host \
-    --ulimit memlock=-1 \
-    --ulimit stack=67108864 \
-    -v "${MEGATRON_DIR}:/workspace/megatron" \
-    -v "${CHECKPOINT_DIR}:/workspace/checkpoints" \
-    -v "${TENSORBOARD_DIR}:/workspace/tensorboard" \
-    ${DOCKER_DATA_MOUNT:-} \
-    -w /workspace/megatron \
-    -e GPUS_PER_NODE="$GPUS_PER_NODE" \
-    -e NUM_NODES="$NUM_NODES" \
-    -e NODE_RANK="$NODE_RANK" \
-    -e MASTER_ADDR="$MASTER_ADDR" \
-    -e MASTER_PORT="$MASTER_PORT" \
-    -e ALL_ARGS="$ALL_ARGS" \
-    "$DOCKER_IMAGE" \
-    bash -c '
-        echo "Starting Lorentz MoE training..."
+# Build bind mounts
+BIND_MOUNTS="--bind ${MEGATRON_DIR}:/workspace/megatron"
+BIND_MOUNTS="${BIND_MOUNTS} --bind ${CHECKPOINT_DIR}:/workspace/checkpoints"
+BIND_MOUNTS="${BIND_MOUNTS} --bind ${TENSORBOARD_DIR}:/workspace/tensorboard"
+
+if [ -n "$HOST_DATA_DIR" ]; then
+    BIND_MOUNTS="${BIND_MOUNTS} --bind ${HOST_DATA_DIR}:/workspace/data"
+fi
+
+echo "Starting Lorentz MoE training in Apptainer (Node $NODE_RANK)..."
+
+apptainer exec --nv \
+    ${BIND_MOUNTS} \
+    --pwd /workspace/megatron \
+    "${APPTAINER_IMAGE}" \
+    bash -c "
+        export PYTHONPATH=/workspace/megatron:\${PYTHONPATH}
+        # Required for tensor model parallelism (TP > 1)
+        export CUDA_DEVICE_MAX_CONNECTIONS=1
+
         torchrun \
-            --nproc_per_node $GPUS_PER_NODE \
-            --nnodes $NUM_NODES \
-            --node_rank $NODE_RANK \
-            --master_addr $MASTER_ADDR \
-            --master_port $MASTER_PORT \
-            pretrain_lorentz_moe_gpt.py \
-            $ALL_ARGS
-    '
+            --nproc_per_node ${GPUS_PER_NODE} \
+            --nnodes ${NUM_NODES} \
+            --node_rank ${NODE_RANK} \
+            --master_addr ${MASTER_ADDR} \
+            --master_port ${MASTER_PORT} \
+            pretrain_lorentz_gpt.py \
+            ${ALL_ARGS}
+    "
 
 echo "=============================================="
-echo "Training completed!"
+echo "Training completed on node $NODE_RANK!"
 echo "=============================================="

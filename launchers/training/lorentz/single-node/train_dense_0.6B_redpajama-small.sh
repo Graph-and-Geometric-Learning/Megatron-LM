@@ -1,10 +1,16 @@
 #!/bin/bash
 # =============================================================================
-# Lorentz Dense GPT: 193M with RedPajama-Small
+# Lorentz Dense GPT: 0.6B with RedPajama-Small
 # =============================================================================
 # Single-node training with RedPajama small dataset (runs in Docker).
 #
-# Model: ~193M parameters (115M if embeddings tied)
+# Model: ~621M parameters (Qwen3-0.6B architecture)
+#   - Embeddings: 151936 × 1024 = 155.6M
+#   - Attention per layer: Q(1M) + K(0.5M) + V(0.5M) + O(1M) = 3M
+#   - FFN per layer: 3 × 1024 × 3072 = 9.4M
+#   - 28 layers × 12.4M = 347M
+#   - Output layer: 1024 × 151936 = 155.6M
+#   - Total: ~621M (or ~465M if embeddings tied)
 # =============================================================================
 
 set -e
@@ -27,15 +33,15 @@ fi
 # =============================================================================
 # Export Config for Base Script
 # =============================================================================
-export MODEL_NAME="lorentz-dense-193M-redpajama-small"
+export MODEL_NAME="lorentz-dense-0.6B-redpajama-small"
 
-# Model Architecture (tuned for 8 GPU memory)
+# Model Architecture (Qwen3-0.6B)
 export MODEL_ARGS=(
-    --hidden-size 512
-    --num-layers 12
-    --num-attention-heads 8
-    --num-kv-heads 4
-    --ffn-hidden-size 1536
+    --hidden-size 1024
+    --num-layers 28
+    --num-attention-heads 16
+    --num-kv-heads 8
+    --ffn-hidden-size 3072
     --vocab-size 151936
     --seq-length 1024
 )
@@ -61,4 +67,4 @@ export SAVE_INTERVAL=500
 # Run
 # =============================================================================
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "${SCRIPT_DIR}/_train_dense_base_docker.sh"
+source "${SCRIPT_DIR}/../base/_train_dense_base_docker.sh"

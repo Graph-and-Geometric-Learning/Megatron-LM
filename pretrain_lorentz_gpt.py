@@ -1,697 +1,362 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
-#
-# Pretrain Lorentz GPT model with hyperbolic geometry.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""
-Pretrain Lorentz GPT Model.
+"""Pretrain Lorentz GPT (Dense or MoE).
 
-Standalone training script for hyperbolic GPT with Qwen3-like architecture.
-Uses PyTorch DDP for distributed training.
-
-Usage:
-    torchrun --nproc_per_node=2 pretrain_lorentz_gpt.py --config qwen3_0.6b
-
-Features:
-    - Lorentz (hyperbolic) geometry in all transformer components
-    - GQA (Grouped Query Attention) support
-    - SwiGLU MLP
-    - RMSNorm
-    - Supports dummy data or real tokenized data
+Based on pretrain_gpt.py with only the model builder changed to use Lorentz geometry.
+Use --use-lorentz-moe for MoE, otherwise dense Lorentz GPT.
 """
 
-import argparse
-import json
-import math
-import os
-import sys
+# Capture the true program start time BEFORE any heavy imports.
 import time
-from dataclasses import dataclass, field, asdict
-from pathlib import Path
-from typing import Optional, Tuple, Iterator
+_PROGRAM_START_TIME = time.time()
 
-import numpy as np
+import json
+
+# Suppress warnings on all ranks but rank 0.
+import os
+import warnings
+rank = int(os.environ.get('RANK', 0))
+if rank != 0:
+    warnings.filterwarnings("ignore", category=UserWarning)
+    warnings.filterwarnings("ignore", category=FutureWarning)
+
+from functools import partial
+from typing import List, Optional, Tuple
+
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader, Dataset, DistributedSampler
 
-# Add megatron to path
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-from megatron.core.manifolds import Lorentz, project_space_to_lorentz
-from megatron.core.transformer.lorentz_norm import LorentzRMSNorm
-from megatron.core.transformer.lorentz_residual import LorentzResidual
-from megatron.core.transformer.lorentz_attention import LorentzDotProductAttention
-from megatron.core.transformer.lorentz_mlp import LorentzMLP
-from megatron.core.models.gpt.lorentz_gpt_model import (
-    LorentzEmbedding,
-    LorentzOutputLayer,
+from lorentz_gpt_builders import gpt_builder_lorentz_moe, gpt_builder_lorentz_dense
+from megatron.core import parallel_state
+from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
+from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
+from megatron.core.enums import ModelType
+from megatron.core.models.gpt import GPTModel
+from megatron.core.rerun_state_machine import get_rerun_state_machine
+from megatron.core.utils import get_attr_wrapped_model, get_thd_batch_on_this_cp_rank, get_batch_on_this_hybrid_cp_rank, StragglerDetector
+from megatron.core.tokenizers.text.utils.build_tokenizer import build_tokenizer
+from megatron.training import (
+    get_args,
+    get_timers,
+    get_tokenizer,
+    inprocess_restart,
+    pretrain,
+    print_rank_0,
+    set_startup_timestamps,
 )
+from megatron.training.datasets.sft_dataset import SFTDataset
+from megatron.core.transformer.multi_token_prediction import mtp_on_this_rank, get_mtp_ranks
+from megatron.training.arguments import core_transformer_config_from_args
+from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
+from megatron.training.utils import (
+    get_batch_on_this_cp_rank,
+    get_batch_on_this_tp_rank,
+    get_blend_and_blend_per_split,
+    is_first_or_last_pipeline_stage,
+)
+from model_provider import model_provider
+
+try:
+    from megatron.post_training.arguments import add_modelopt_args
+    from megatron.post_training.loss_func import loss_func as loss_func_modelopt
+
+    has_nvidia_modelopt = True
+except ImportError:
+    has_nvidia_modelopt = False
+
+stimer = StragglerDetector()
 
 
-# =============================================================================
-# Model Configuration
-# =============================================================================
+def get_batch(data_iterator, vp_stage: Optional[int] = None):
+    """Generate a batch."""
+    args = get_args()
+    config = core_transformer_config_from_args(args)
+    # TODO: this is pretty hacky, find a better way
+    if not is_first_or_last_pipeline_stage(vp_stage) and (
+    (not mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage))):
+        return None, None, None, None, None, None
 
-@dataclass
-class LorentzGPTConfig:
-    """Configuration for Lorentz GPT model."""
-
-    # Model name
-    name: str = "lorentz-gpt"
-
-    # Architecture
-    hidden_size: int = 1024
-    num_layers: int = 28
-    num_attention_heads: int = 16
-    num_kv_heads: int = 8  # For GQA
-    ffn_hidden_size: int = 3072
-    vocab_size: int = 151936
-    max_seq_length: int = 2048
-
-    # Normalization
-    norm_epsilon: float = 1e-6
-
-    # Dropout (Qwen3 uses 0)
-    attention_dropout: float = 0.0
-    hidden_dropout: float = 0.0
-
-    # Hyperbolic settings
-    curvature: float = 1.0
-    learnable_curvature: bool = False
-
-    # Derived properties
-    @property
-    def kv_channels(self) -> int:
-        return self.hidden_size // self.num_attention_heads
-
-    def to_dict(self):
-        return asdict(self)
-
-
-# Preset configurations
-CONFIGS = {
-    # Test config (small, for debugging)
-    "test": LorentzGPTConfig(
-        name="lorentz-gpt-test",
-        hidden_size=256,
-        num_layers=4,
-        num_attention_heads=4,
-        num_kv_heads=2,
-        ffn_hidden_size=768,
-        vocab_size=1024,
-        max_seq_length=512,
-    ),
-    # Qwen3-0.6B-like config
-    "qwen3_0.6b": LorentzGPTConfig(
-        name="lorentz-gpt-qwen3-0.6b",
-        hidden_size=1024,
-        num_layers=28,
-        num_attention_heads=16,
-        num_kv_heads=8,
-        ffn_hidden_size=3072,
-        vocab_size=151936,
-        max_seq_length=2048,
-    ),
-    # Smaller variant for faster iteration
-    "qwen3_0.6b_small": LorentzGPTConfig(
-        name="lorentz-gpt-qwen3-0.6b-small",
-        hidden_size=512,
-        num_layers=12,
-        num_attention_heads=8,
-        num_kv_heads=4,
-        ffn_hidden_size=1536,
-        vocab_size=32000,
-        max_seq_length=1024,
-    ),
-}
-
-
-# =============================================================================
-# Model Components
-# =============================================================================
-
-class LorentzSelfAttention(nn.Module):
-    """Lorentz self-attention with GQA support."""
-
-    def __init__(self, manifold: Lorentz, config: LorentzGPTConfig, layer_idx: int = 0):
-        super().__init__()
-        self.manifold = manifold
-        self.config = config
-        self.hidden_size = config.hidden_size
-        self.num_heads = config.num_attention_heads
-        self.num_kv_heads = config.num_kv_heads
-        self.head_dim = config.kv_channels
-
-        # QKV projections
-        self.q_proj = nn.Linear(config.hidden_size, self.num_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(config.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(config.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, config.hidden_size, bias=False)
-
-        # Core attention
-        self.core_attention = LorentzDotProductAttention(
-            manifold=manifold,
-            num_attention_heads=self.num_heads,
-            hidden_size_per_head=self.head_dim,
-            attention_dropout=config.attention_dropout,
-            layer_number=layer_idx,
+    # get batches based on the TP rank you are on
+    batch = get_batch_on_this_tp_rank(
+        data_iterator,
+        mtp_on_this_rank=mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage)
         )
 
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        batch_size, seq_length, _ = hidden_states.shape
-
-        # Extract space-like dimensions
-        x_space = hidden_states[..., 1:]
-
-        # Project to Q, K, V
-        q = self.q_proj(x_space).view(batch_size, seq_length, self.num_heads, self.head_dim)
-        k = self.k_proj(x_space).view(batch_size, seq_length, self.num_kv_heads, self.head_dim)
-        v = self.v_proj(x_space).view(batch_size, seq_length, self.num_kv_heads, self.head_dim)
-
-        # GQA: expand K, V
-        if self.num_kv_heads < self.num_heads:
-            n_rep = self.num_heads // self.num_kv_heads
-            k = k.unsqueeze(3).expand(-1, -1, -1, n_rep, -1).reshape(
-                batch_size, seq_length, self.num_heads, self.head_dim
-            )
-            v = v.unsqueeze(3).expand(-1, -1, -1, n_rep, -1).reshape(
-                batch_size, seq_length, self.num_heads, self.head_dim
-            )
-
-        # Transpose to (batch, heads, seq, dim)
-        q, k, v = [x.transpose(1, 2) for x in (q, k, v)]
-
-        # Project to Lorentz manifold
-        q = project_space_to_lorentz(q, self.manifold.c)
-        k = project_space_to_lorentz(k, self.manifold.c)
-        v = project_space_to_lorentz(v, self.manifold.c)
-
-        # Core attention
-        attn_output, _ = self.core_attention(q, k, v, attention_mask)
-
-        # Reshape and project output
-        attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output_space = attn_output[..., 1:].contiguous()
-        attn_output_space = attn_output_space.view(batch_size, seq_length, -1)
-        output_space = self.o_proj(attn_output_space)
-
-        return project_space_to_lorentz(output_space, self.manifold.c)
-
-
-class LorentzTransformerLayer(nn.Module):
-    """Single Lorentz transformer layer."""
-
-    def __init__(self, manifold: Lorentz, config: LorentzGPTConfig, layer_idx: int = 0):
-        super().__init__()
-        self.manifold = manifold
-
-        self.input_layernorm = LorentzRMSNorm(manifold, config.hidden_size, config.norm_epsilon)
-        self.self_attention = LorentzSelfAttention(manifold, config, layer_idx)
-        self.attn_residual = LorentzResidual(manifold)
-        self.pre_mlp_layernorm = LorentzRMSNorm(manifold, config.hidden_size, config.norm_epsilon)
-        self.mlp = LorentzMLP(manifold, config.hidden_size, config.ffn_hidden_size, bias=False)
-        self.mlp_residual = LorentzResidual(manifold)
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        # Attention block
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attention(hidden_states, attention_mask)
-        hidden_states = self.attn_residual(residual, hidden_states)
-
-        # MLP block
-        residual = hidden_states
-        hidden_states = self.pre_mlp_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = self.mlp_residual(residual, hidden_states)
-
-        return hidden_states
-
-
-class LorentzGPT(nn.Module):
-    """Full Lorentz GPT model."""
-
-    def __init__(self, config: LorentzGPTConfig):
-        super().__init__()
-        self.config = config
-
-        self.manifold = Lorentz(c=config.curvature, learnable=config.learnable_curvature)
-        self.embedding = LorentzEmbedding(self.manifold, config.vocab_size, config.hidden_size)
-
-        self.layers = nn.ModuleList([
-            LorentzTransformerLayer(self.manifold, config, i)
-            for i in range(config.num_layers)
-        ])
-
-        self.final_norm = LorentzRMSNorm(self.manifold, config.hidden_size, config.norm_epsilon)
-        self.output_layer = LorentzOutputLayer(self.manifold, config.hidden_size, config.vocab_size)
-
-        self.apply(self._init_weights)
-
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        labels: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        hidden_states = self.embedding(input_ids)
-
-        # Create causal mask
-        if attention_mask is None:
-            seq_length = input_ids.shape[1]
-            attention_mask = torch.triu(
-                torch.ones(seq_length, seq_length, dtype=torch.bool, device=input_ids.device),
-                diagonal=1
-            )
-
-        for layer in self.layers:
-            hidden_states = layer(hidden_states, attention_mask)
-
-        hidden_states = self.final_norm(hidden_states)
-        logits = self.output_layer(hidden_states)
-
-        loss = None
-        if labels is not None:
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            loss = F.cross_entropy(
-                shift_logits.view(-1, self.config.vocab_size),
-                shift_labels.view(-1),
-                ignore_index=-100,
-            )
-
-        return logits, loss
-
-    def get_num_params(self) -> int:
-        return sum(p.numel() for p in self.parameters())
-
-
-# =============================================================================
-# Dataset
-# =============================================================================
-
-class DummyDataset(Dataset):
-    """Dummy dataset with random tokens."""
-
-    def __init__(self, vocab_size: int, seq_length: int, num_samples: int):
-        self.vocab_size = vocab_size
-        self.seq_length = seq_length
-        self.num_samples = num_samples
-
-    def __len__(self):
-        return self.num_samples
-
-    def __getitem__(self, idx):
-        tokens = torch.randint(0, self.vocab_size, (self.seq_length,))
-        return {"input_ids": tokens, "labels": tokens.clone()}
-
-
-class TokenizedDataset(Dataset):
-    """Dataset from tokenized .bin file (Megatron format)."""
-
-    def __init__(self, data_path: str, seq_length: int):
-        import numpy as np
-
-        self.seq_length = seq_length
-
-        # Load .bin file
-        bin_path = f"{data_path}.bin"
-        idx_path = f"{data_path}.idx"
-
-        if os.path.exists(bin_path):
-            self.data = np.memmap(bin_path, dtype=np.int32, mode='r')
-            self.num_samples = len(self.data) // seq_length
-        else:
-            raise FileNotFoundError(f"Data file not found: {bin_path}")
-
-    def __len__(self):
-        return self.num_samples
-
-    def __getitem__(self, idx):
-        start = idx * self.seq_length
-        end = start + self.seq_length
-        tokens = torch.from_numpy(self.data[start:end].astype(np.int64))
-        return {"input_ids": tokens, "labels": tokens.clone()}
-
-
-# =============================================================================
-# Training
-# =============================================================================
-
-@dataclass
-class TrainingArgs:
-    """Training arguments."""
-
-    # Data
-    data_path: Optional[str] = None
-    num_samples: int = 10000
-
-    # Training
-    batch_size: int = 4
-    micro_batch_size: int = 1
-    lr: float = 3e-4
-    min_lr: float = 3e-5
-    weight_decay: float = 0.1
-    max_steps: int = 1000
-    warmup_steps: int = 100
-    grad_clip: float = 1.0
-
-    # Precision
-    bf16: bool = True
-
-    # Logging
-    log_interval: int = 10
-    eval_interval: int = 100
-    save_interval: int = 500
-
-    # Checkpointing
-    checkpoint_dir: str = "./checkpoints"
-    resume_from: Optional[str] = None
-
-    # Distributed
-    local_rank: int = -1
-
-
-def setup_distributed():
-    """Initialize distributed training."""
-    if "RANK" in os.environ:
-        dist.init_process_group(backend="nccl")
-        rank = dist.get_rank()
-        world_size = dist.get_world_size()
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        torch.cuda.set_device(local_rank)
-        return rank, world_size, local_rank
-    return 0, 1, 0
-
-
-def cleanup_distributed():
-    """Cleanup distributed training."""
-    if dist.is_initialized():
-        dist.destroy_process_group()
-
-
-def get_lr(step: int, args: TrainingArgs) -> float:
-    """Cosine learning rate schedule with warmup."""
-    if step < args.warmup_steps:
-        return args.lr * step / args.warmup_steps
-
-    progress = (step - args.warmup_steps) / max(1, args.max_steps - args.warmup_steps)
-    return args.min_lr + 0.5 * (args.lr - args.min_lr) * (1 + math.cos(math.pi * progress))
-
-
-def train(args: TrainingArgs, config: LorentzGPTConfig):
-    """Main training function."""
-
-    # Setup distributed
-    rank, world_size, local_rank = setup_distributed()
-    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
-    is_main = rank == 0
-
-    if is_main:
-        print("=" * 60)
-        print("Lorentz GPT Training")
-        print("=" * 60)
-
-    if is_main:
-        print(f"Config: {config.name}")
-        print(f"  hidden_size: {config.hidden_size}")
-        print(f"  num_layers: {config.num_layers}")
-        print(f"  num_heads: {config.num_attention_heads}")
-        print(f"  num_kv_heads: {config.num_kv_heads}")
-        print(f"  ffn_hidden_size: {config.ffn_hidden_size}")
-        print(f"  vocab_size: {config.vocab_size}")
-        print(f"  curvature: {config.curvature}")
-
-    # Create model
-    model = LorentzGPT(config).to(device)
-
-    if is_main:
-        num_params = model.get_num_params()
-        print(f"Parameters: {num_params:,} ({num_params/1e6:.2f}M)")
-
-    # Wrap with DDP
-    if world_size > 1:
-        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
-
-    # Create dataset
-    if args.data_path:
-        dataset = TokenizedDataset(args.data_path, config.max_seq_length)
+    cu_seqlens = batch.pop('cu_seqlens', None)
+    cu_seqlens_padded = batch.pop('cu_seqlens_padded', None)
+    max_seqlen = batch.pop('max_seqlen', None)
+    local_cp_size = batch.pop('local_cp_size', None)
+    if local_cp_size is not None:
+        local_cp_size = int(local_cp_size.item())
+
+    if cu_seqlens is None and local_cp_size is None:
+        # slice batch along sequence dimension for context parallelism
+        batch = get_batch_on_this_cp_rank(batch)  # The implementation of this function is in MCore
+        packed_seq_params = None
+    elif local_cp_size is None:  # Packed THD format
+        assert max_seqlen.dim() == 1
+        batch, packed_seq_params = get_thd_batch_on_this_cp_rank(batch, cu_seqlens, cu_seqlens_padded, max_seqlen)
+    else: # Hybrid CP format
+        batch, packed_seq_params = get_batch_on_this_hybrid_cp_rank(batch, local_cp_size)
+    
+    return (*batch.values(), packed_seq_params)
+
+
+# define spiky loss as a loss that's 10x the max loss observed
+SPIKY_LOSS_FACTOR = 10
+
+
+def loss_func(
+    loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: Optional[GPTModel] = None
+):
+    """Loss function.
+
+    Args:
+        loss_mask (torch.Tensor): Used to mask out some portions of the loss
+        output_tensor (torch.Tensor): The tensor with the losses
+        model (GPTModel, optional): The model (can be wrapped)
+
+    Returns:
+        the loss scalar for this micro-batch
+        the number of non-padded tokens in this microbatch
+        a dict containing reporting metrics on the loss and number of tokens across
+            the data parallel ranks
+    """
+    args = get_args()
+
+    if has_nvidia_modelopt and getattr(args, 'modelopt_enabled', False):  # [ModelOpt]
+        loss, num_tokens, report = loss_func_modelopt(loss_mask, output_tensor, model=model)
     else:
-        dataset = DummyDataset(config.vocab_size, config.max_seq_length, args.num_samples)
+        losses = output_tensor.view(-1).float()
+        loss_mask = loss_mask.view(-1).float()
+        loss = torch.sum(losses * loss_mask)
 
-    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
-    dataloader = DataLoader(
-        dataset,
-        batch_size=args.micro_batch_size,
-        sampler=sampler,
-        num_workers=2,
-        pin_memory=True,
-    )
+        num_tokens = loss_mask.sum().clone().detach().to(torch.int)
+        report = {'lm loss': torch.cat([loss.clone().detach().view(1), num_tokens.view(1)])}
 
-    if is_main:
-        print(f"Dataset: {len(dataset)} samples")
-        print(f"Batch size: {args.batch_size} (micro: {args.micro_batch_size})")
-        print(f"Device: {device}")
-        print(f"World size: {world_size}")
-        print("=" * 60)
+    # Check individual rank losses are not NaN prior to DP all-reduce.
+    rerun_state_machine = get_rerun_state_machine()
+    if args.check_for_nan_in_loss_and_grad:
+        rerun_state_machine.validate_result(
+            result=loss,
+            rejection_func=torch.isnan,
+            message="found NaN in local forward loss calculation",
+            tolerance=0.0,  # forward pass calculations are determinisic
+            fatal=True,
+        )
+        rerun_state_machine.validate_result(
+            result=loss,
+            rejection_func=torch.isinf,
+            message="found Inf in local forward loss calculation",
+            tolerance=0.0,  # forward pass calculations are determinisic
+            fatal=True,
+        )
+    # Check for spiky loss
+    if args.check_for_spiky_loss:
+        rerun_state_machine.validate_result(
+            result=loss,
+            rejection_func=partial(
+                rerun_state_machine.is_unexpectedly_large,
+                threshold=SPIKY_LOSS_FACTOR,
+                context="loss",
+            ),
+            message="Spiky loss",
+            tolerance=0.0,  # forward pass calculations are determinisic
+            fatal=False,
+        )
 
-    # Optimizer
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=args.lr,
-        betas=(0.9, 0.95),
-        weight_decay=args.weight_decay,
-    )
+    return loss, num_tokens, report
 
-    # Mixed precision
-    # Note: GradScaler is only needed for fp16, not bf16
-    # BF16 has same exponent range as fp32, so no loss scaling needed
-    scaler = None
-    autocast_dtype = torch.bfloat16 if args.bf16 else torch.float32
 
-    # Gradient accumulation
-    grad_accum_steps = max(1, args.batch_size // (args.micro_batch_size * world_size))
-    if is_main:
-        print(f"Gradient accumulation steps: {grad_accum_steps}")
+def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = False):
+    """Forward training step.
 
-    # Training loop
-    model.train()
-    data_iter = iter(dataloader)
+    Args:
+        data_iterator : Input data iterator
+        model (GPTModel): The GPT Model
+        return_schedule_plan (bool): Whether to return the schedule plan instead of the output tensor
+    """
+    args = get_args()
+    timers = get_timers()
 
-    total_tokens = 0
-    start_time = time.time()
+    # Get the batch.
+    timers('batch-generator', log_level=2).start()
+    global stimer
+    with stimer(bdata=True):
+        vp_stage = get_attr_wrapped_model(model, "vp_stage")
+        tokens, labels, loss_mask, attention_mask, position_ids, packed_seq_params = get_batch(data_iterator, vp_stage)
+    timers('batch-generator').stop()
 
-    for step in range(1, args.max_steps + 1):
-        # Update learning rate
-        lr = get_lr(step, args)
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = lr
-
-        # Accumulate gradients
-        total_loss = 0.0
-        optimizer.zero_grad()
-
-        for micro_step in range(grad_accum_steps):
-            try:
-                batch = next(data_iter)
-            except StopIteration:
-                sampler.set_epoch(step)
-                data_iter = iter(dataloader)
-                batch = next(data_iter)
-
-            input_ids = batch["input_ids"].to(device)
-            labels = batch["labels"].to(device)
-
-            with torch.amp.autocast(device_type="cuda", dtype=autocast_dtype, enabled=args.bf16):
-                _, loss = model(input_ids, labels=labels)
-                loss = loss / grad_accum_steps
-
-            if scaler:
-                scaler.scale(loss).backward()
-            else:
-                loss.backward()
-
-            total_loss += loss.item()
-
-        # Gradient clipping and optimizer step
-        if scaler:
-            scaler.unscale_(optimizer)
-
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-
-        if scaler:
-            scaler.step(optimizer)
-            scaler.update()
+    with stimer:
+        if args.use_legacy_models:
+            output_tensor = model(tokens, position_ids, attention_mask, labels=labels)
         else:
-            optimizer.step()
+            if return_schedule_plan:
+                assert args.overlap_moe_expert_parallel_comm, \
+                    "overlap_moe_expert_parallel_comm must be enabled to return the schedule plan"
+                schedule_plan = model.build_schedule_plan(
+                    tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask
+                )
+                return schedule_plan, partial(loss_func, loss_mask, model=model)
+            else:
+                output_tensor = model(
+                    tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask, packed_seq_params=packed_seq_params
+                )
 
-        # Update token count
-        tokens_per_step = args.batch_size * config.max_seq_length
-        total_tokens += tokens_per_step
-
-        # Logging
-        if step % args.log_interval == 0 and is_main:
-            elapsed = time.time() - start_time
-            tokens_per_sec = total_tokens / elapsed
-
-            print(f"Step {step:5d} | Loss: {total_loss:.4f} | LR: {lr:.2e} | "
-                  f"Grad: {grad_norm:.2f} | Tok/s: {tokens_per_sec:.0f}")
-
-        # Save checkpoint
-        if step % args.save_interval == 0 and is_main:
-            save_checkpoint(model, optimizer, step, args, config)
-
-    # Final save
-    if is_main:
-        save_checkpoint(model, optimizer, args.max_steps, args, config)
-        print("=" * 60)
-        print("Training complete!")
-        print("=" * 60)
-
-    cleanup_distributed()
+    # [ModelOpt]: model is needed to access ModelOpt distillation losses
+    return output_tensor, partial(loss_func, loss_mask, model=model)
 
 
-def save_checkpoint(model, optimizer, step, args, config):
-    """Save model checkpoint."""
-    os.makedirs(args.checkpoint_dir, exist_ok=True)
+def is_dataset_built_on_rank(vp_stage=None):
+    args = get_args()
+    config = core_transformer_config_from_args(args)
+    return (
+        is_first_or_last_pipeline_stage(vp_stage)
+        or mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage)
+    ) and parallel_state.get_tensor_model_parallel_rank() == 0
 
-    # Get raw model (unwrap DDP if needed)
-    raw_model = model.module if hasattr(model, 'module') else model
 
-    checkpoint = {
-        "step": step,
-        "model_state_dict": raw_model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-        "config": config.to_dict(),
+def core_gpt_dataset_config_from_args(args):
+    if args.legacy_tokenizer:
+        tokenizer = get_tokenizer()
+    else:
+        tokenizer = build_tokenizer(args)
+
+    # Sometimes --data-path is too long, instead we parse it from a file.
+    blend: Optional[Tuple[List[str], Optional[List[float]]]]
+    blend_per_split: Optional[List[Optional[Tuple[List[str], Optional[List[float]]]]]]
+    blend, blend_per_split = get_blend_and_blend_per_split(args)
+
+    sequences_per_dataset = None
+    if args.per_dataset_sequences_path is not None:
+        with open(args.per_dataset_sequences_path, "r") as f:
+            sequences_per_dataset = json.load(f)
+
+    data_args = {
+        "random_seed": args.seed,
+        "sequence_length": args.seq_length,
+        "blend": blend,
+        "blend_per_split": blend_per_split,
+        "split": args.split,
+        "multiple_validation_sets": args.multiple_validation_sets,
+        "full_validation": args.full_validation,
+        "num_dataset_builder_threads": args.num_dataset_builder_threads,
+        "path_to_cache": args.data_cache_path,
+        "mmap_bin_files": args.mmap_bin_files,
+        "tokenizer": tokenizer,
+        "reset_position_ids": args.reset_position_ids,
+        "reset_attention_mask": args.reset_attention_mask,
+        "eod_mask_loss": args.eod_mask_loss,
+        "create_attention_mask": args.create_attention_mask_in_dataloader,
+        "object_storage_cache_path": args.object_storage_cache_path,
+        "mid_level_dataset_surplus": args.mid_level_dataset_surplus,
+        "allow_ambiguous_pad_tokens": args.allow_ambiguous_pad_tokens,
+        "fast_cache_load": args.dataloader_fast_cache_load,
+        "sequences_per_dataset": sequences_per_dataset,
+        "defer_npy_index_mmap": args.dataloader_defer_npy_index_mmap,
+        "context_parallel_size": args.context_parallel_size,
+        "data_parallel_size": args.data_parallel_size,
+        "sequence_parallel_size": args.tensor_model_parallel_size*args.sequence_parallel,
+        "hybrid_context_parallel": args.hybrid_context_parallel,
     }
 
-    path = os.path.join(args.checkpoint_dir, f"checkpoint_step{step}.pt")
-    torch.save(checkpoint, path)
-    print(f"Saved checkpoint: {path}")
+    # add FIM args to the config
+    if args.fim_data:
+        extra_tokens = {
+            "prefix": args.fim_prefix_token,
+            "middle": args.fim_middle_token,
+            "suffix": args.fim_suffix_token,
+            "pad": args.fim_pad_token,
+            "eod": args.fim_eod_token,
+        }
+        data_args.update(
+            {
+                "fim_rate": args.fim_rate,
+                "fim_spm_rate": args.fim_spm_rate,
+                "fim_extra_tokens": extra_tokens,
+                "fim_split_sample": args.fim_split_sample,
+                "fim_fragment_rate": args.fim_fragment_rate,
+                "fim_no_prefix": args.fim_no_prefix,
+            }
+        )
+        return GPTFIMDatasetConfig(**data_args)
 
-    # Save config
-    config_path = os.path.join(args.checkpoint_dir, "config.json")
-    with open(config_path, "w") as f:
-        json.dump(config.to_dict(), f, indent=2)
+    return GPTDatasetConfig(**data_args)
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Pretrain Lorentz GPT")
+def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None):
+    """Build the train test and validation datasets.
 
-    # Model Architecture
-    parser.add_argument("--hidden-size", type=int, default=1024,
-                        help="Hidden size")
-    parser.add_argument("--num-layers", type=int, default=28,
-                        help="Number of transformer layers")
-    parser.add_argument("--num-attention-heads", type=int, default=16,
-                        help="Number of attention heads")
-    parser.add_argument("--num-kv-heads", type=int, default=8,
-                        help="Number of KV heads for GQA")
-    parser.add_argument("--ffn-hidden-size", type=int, default=3072,
-                        help="FFN hidden size")
-    parser.add_argument("--vocab-size", type=int, default=151936,
-                        help="Vocabulary size")
-    parser.add_argument("--seq-length", type=int, default=2048,
-                        help="Sequence length")
+    Args:
+        train_val_test_num_samples : A list containing the number of samples in train test and validation.
+    """
+    args = get_args()
 
-    # Hyperbolic Configuration
-    parser.add_argument("--curvature", type=float, default=1.0,
-                        help="Hyperbolic curvature")
+    config = core_gpt_dataset_config_from_args(args)
 
-    # Data
-    parser.add_argument("--data-path", type=str, default=None,
-                        help="Path to tokenized data (without .bin/.idx extension)")
-    parser.add_argument("--num-samples", type=int, default=10000,
-                        help="Number of samples for dummy data")
+    if args.sft:
+        dataset_type = SFTDataset
+    else:
+        if args.mock_data:
+            dataset_type = MockGPTDataset
+        elif args.fim_data:
+            dataset_type = GPTFIMDataset
+        else:
+            dataset_type = GPTDataset
 
-    # Training
-    parser.add_argument("--batch-size", type=int, default=32,
-                        help="Global batch size")
-    parser.add_argument("--micro-batch-size", type=int, default=4,
-                        help="Micro batch size per GPU")
-    parser.add_argument("--lr", type=float, default=3e-4,
-                        help="Peak learning rate")
-    parser.add_argument("--min-lr", type=float, default=3e-5,
-                        help="Minimum learning rate")
-    parser.add_argument("--weight-decay", type=float, default=0.1,
-                        help="Weight decay")
-    parser.add_argument("--max-steps", type=int, default=1000,
-                        help="Maximum training steps")
-    parser.add_argument("--warmup-steps", type=int, default=100,
-                        help="Warmup steps")
-    parser.add_argument("--grad-clip", type=float, default=1.0,
-                        help="Gradient clipping")
+    print_rank_0("> building train, validation, and test datasets for Lorentz MoE GPT ...")
 
-    # Precision
-    parser.add_argument("--bf16", action="store_true", default=True,
-                        help="Use BF16 mixed precision")
-    parser.add_argument("--no-bf16", action="store_false", dest="bf16",
-                        help="Disable BF16")
+    is_dataset_built = partial(is_dataset_built_on_rank, vp_stage=vp_stage)
+    train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
+        dataset_type, train_val_test_num_samples, partial(is_dataset_built_on_rank, vp_stage=vp_stage), config
+    ).build()
 
-    # Logging
-    parser.add_argument("--log-interval", type=int, default=10,
-                        help="Log every N steps")
-    parser.add_argument("--save-interval", type=int, default=500,
-                        help="Save checkpoint every N steps")
+    print_rank_0("> finished creating Lorentz MoE GPT datasets ...")
 
-    # Checkpointing
-    parser.add_argument("--checkpoint-dir", type=str, default="./checkpoints",
-                        help="Checkpoint directory")
+    return train_ds, valid_ds, test_ds
 
-    args = parser.parse_args()
 
-    # Create model config from command-line args
-    config = LorentzGPTConfig(
-        name="lorentz-gpt",
-        hidden_size=args.hidden_size,
-        num_layers=args.num_layers,
-        num_attention_heads=args.num_attention_heads,
-        num_kv_heads=args.num_kv_heads,
-        ffn_hidden_size=args.ffn_hidden_size,
-        vocab_size=args.vocab_size,
-        max_seq_length=args.seq_length,
-        curvature=args.curvature,
-    )
-
-    # Convert to TrainingArgs
-    training_args = TrainingArgs(
-        data_path=args.data_path,
-        num_samples=args.num_samples,
-        batch_size=args.batch_size,
-        micro_batch_size=args.micro_batch_size,
-        lr=args.lr,
-        min_lr=args.min_lr,
-        weight_decay=args.weight_decay,
-        max_steps=args.max_steps,
-        warmup_steps=args.warmup_steps,
-        grad_clip=args.grad_clip,
-        bf16=args.bf16,
-        log_interval=args.log_interval,
-        save_interval=args.save_interval,
-        checkpoint_dir=args.checkpoint_dir,
-    )
-
-    train(training_args, config)
+def get_embedding_ranks(pp_ranks: List[int]):
+    """Get the embedding ranks."""
+    embedding_ranks = [pp_ranks[0]]
+    if len(pp_ranks) > 1:
+        args = get_args()
+        if not args.untie_embeddings_and_output_weights:
+            embedding_ranks.append(pp_ranks[-1])
+        config = core_transformer_config_from_args(args)
+        mtp_ranks = get_mtp_ranks(pp_ranks, config)
+        embedding_ranks.extend(mtp_ranks)
+    embedding_ranks = list(set(embedding_ranks))
+    embedding_ranks = sorted(embedding_ranks)
+    return embedding_ranks
 
 
 if __name__ == "__main__":
-    main()
+    # Timestamp right after entering __main__ block (after all imports/library setup)
+    _MAIN_ENTRY_TIME = time.time()
+
+    # Register startup timestamps for timing report in pretrain()
+    set_startup_timestamps(program_start=_PROGRAM_START_TIME, main_entry=_MAIN_ENTRY_TIME)
+
+    # Temporary for transition to core datasets
+    train_valid_test_datasets_provider.is_distributed = True
+
+    # Optionally enable inprocess restart on pretrain
+    pretrain, store = inprocess_restart.maybe_wrap_for_inprocess_restart(pretrain)
+
+    # Wrapper that selects builder based on --use-lorentz-moe flag at runtime
+    def gpt_builder_lorentz(args, pre_process, post_process, vp_stage=None, config=None):
+        if getattr(args, 'use_lorentz_moe', False):
+            return gpt_builder_lorentz_moe(args, pre_process, post_process, vp_stage, config)
+        else:
+            return gpt_builder_lorentz_dense(args, pre_process, post_process, vp_stage, config)
+
+    pretrain(
+        train_valid_test_datasets_provider,
+        partial(model_provider, gpt_builder_lorentz),
+        ModelType.encoder_or_decoder,
+        forward_step,
+        args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
+        extra_args_provider=add_modelopt_args if has_nvidia_modelopt else None,
+        store=store,
+        get_embedding_ranks=get_embedding_ranks,
+    )

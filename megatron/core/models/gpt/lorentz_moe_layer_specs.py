@@ -190,7 +190,14 @@ def get_lorentz_gpt_layer_spec(
     Returns:
         ModuleSpec for transformer layer
     """
-    backend: BackendSpecProvider = LocalSpecProvider()
+    # Use TE backend for attention/layernorm when available
+    # Lorentz geometry only affects MoE components (router, experts)
+    # LayerNorm and Attention are standard and benefit from TE optimizations
+    if use_te and HAVE_TE:
+        from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
+        backend: BackendSpecProvider = TESpecProvider()
+    else:
+        backend: BackendSpecProvider = LocalSpecProvider()
 
     # Layer norm - use RMSNorm if configured
     if config.normalization == "RMSNorm":
@@ -316,15 +323,18 @@ def get_lorentz_gpt_decoder_block_spec(
     local_layer_specs = layer_specs[offset : offset + num_layers_to_build]
 
     # Layer norm implementation
-    # Note: FusedLayerNorm (Apex) doesn't support RMSNorm, so use WrappedTorchNorm
+    # Use TENorm when TE is available - it supports sequence parallelism
+    # Note: FusedLayerNorm (Apex) doesn't support RMSNorm, so fallback to WrappedTorchNorm
     if use_te and HAVE_TE:
+        # TENorm supports sequence parallelism and RMSNorm
         layer_norm_impl = TENorm
-    elif config.normalization == "RMSNorm":
-        # RMSNorm requires WrappedTorchNorm (FusedLayerNorm doesn't support it)
+    elif HAVE_APEX and config.normalization != "RMSNorm":
+        # FusedLayerNorm supports sequence parallelism but not RMSNorm
+        layer_norm_impl = FusedLayerNorm
+    else:
+        # WrappedTorchNorm does NOT support sequence parallelism
         from megatron.core.transformer.torch_norm import WrappedTorchNorm
         layer_norm_impl = WrappedTorchNorm
-    else:
-        layer_norm_impl = LNImpl
 
     # Build block spec
     block_spec = TransformerBlockSubmodules(

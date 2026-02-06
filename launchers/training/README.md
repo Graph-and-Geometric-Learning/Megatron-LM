@@ -131,16 +131,16 @@ Mixture of Curvature Experts:
 
 ## Python Training Scripts
 
-The shell launchers call these Python scripts:
+The shell launchers call this Python script:
 
-- `pretrain_lorentz_gpt.py` - Dense model training
-- `pretrain_lorentz_moe_gpt.py` - MoE model training
+- `pretrain_lorentz_gpt.py` - Lorentz GPT training (dense or MoE)
+  - Use `--use-lorentz-moe` flag for MoE, otherwise dense
 
 Direct Python usage:
 ```bash
-# Single GPU
-python pretrain_lorentz_gpt.py --config test
+# Dense Lorentz GPT
+torchrun --nproc_per_node=4 pretrain_lorentz_gpt.py [args]
 
-# Distributed
-torchrun --nproc_per_node=4 pretrain_lorentz_gpt.py --config qwen3_0.6b
+# Lorentz MoE GPT
+torchrun --nproc_per_node=4 pretrain_lorentz_gpt.py --use-lorentz-moe [args]
 ```

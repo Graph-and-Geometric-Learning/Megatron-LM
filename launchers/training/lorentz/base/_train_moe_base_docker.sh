@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# Base Training Script: Lorentz MoE GPT (HELM-MiCE) - Apptainer
+# Base Training Script: Lorentz MoE GPT (HELM-MiCE) - Docker
 # =============================================================================
 # This is the base script - do not run directly.
 # Use the config-specific launcher scripts.
@@ -16,7 +16,7 @@
 #   MOE_ARGS          - MoE configuration arguments
 #   HYPERBOLIC_ARGS   - Hyperbolic geometry arguments
 #   DATA_PATH         - Path to data inside container
-#   HOST_DATA_DIR     - Host path to data directory
+#   DOCKER_DATA_MOUNT - Docker mount for data directory
 #   BATCH_SIZE, MICRO_BATCH_SIZE, LR, MAX_STEPS, etc.
 # =============================================================================
 
@@ -36,7 +36,7 @@ fi
 # =============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-MEGATRON_DIR="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+MEGATRON_DIR="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
 
 CHECKPOINT_DIR=${CHECKPOINT_DIR:-"${MEGATRON_DIR}/checkpoints/${MODEL_NAME}"}
 TENSORBOARD_DIR=${TENSORBOARD_DIR:-"${MEGATRON_DIR}/tensorboard/${MODEL_NAME}"}
@@ -55,17 +55,10 @@ MASTER_PORT=${MASTER_PORT:-29500}
 WORLD_SIZE=$((GPUS_PER_NODE * NUM_NODES))
 
 # =============================================================================
-# Apptainer Configuration
+# Docker Configuration
 # =============================================================================
 
-APPTAINER_IMAGE=${APPTAINER_IMAGE:-"${HOME}/images/lorentz-moe_25.04.sif"}
-
-# Check if image exists
-if [[ ! -f "${APPTAINER_IMAGE}" ]]; then
-    echo "ERROR: Apptainer image not found: ${APPTAINER_IMAGE}"
-    echo "Run: ./launchers/setup/build_lorentz_moe_image.sh"
-    exit 1
-fi
+DOCKER_IMAGE=${DOCKER_IMAGE:-"nvcr.io/nvidia/pytorch:25.04-py3"}
 
 # =============================================================================
 # Parallelism Configuration (Megatron-style)
@@ -123,9 +116,6 @@ TRAINING_ARGS=(
 
     # Use Megatron's distributed optimizer
     --use-distributed-optimizer
-
-    # Use local transformer implementation for Lorentz components
-    --transformer-impl local
 )
 
 # Add data path if provided, otherwise use mock data
@@ -146,7 +136,7 @@ fi
 
 echo "=============================================="
 echo "Lorentz MoE GPT Training (HELM-MiCE)"
-echo "Apptainer Mode"
+echo "Full Megatron Integration"
 echo "=============================================="
 echo "Model: $MODEL_NAME"
 echo "Data: ${DATA_PATH:-'mock data'}"
@@ -156,7 +146,7 @@ echo "Batch: ${GLOBAL_BATCH_SIZE} global (micro: ${MICRO_BATCH_SIZE:-1})"
 echo "Steps: ${MAX_STEPS:-1000} (warmup: ${WARMUP_STEPS:-100})"
 echo "LR: ${LR:-3e-4} -> ${MIN_LR:-3e-5}"
 echo "Checkpoint: $CHECKPOINT_DIR"
-echo "Apptainer: $APPTAINER_IMAGE"
+echo "Docker: $DOCKER_IMAGE"
 echo "=============================================="
 echo "MoE Settings:"
 echo "  Experts: ${NUM_EXPERTS:-8}"
@@ -171,39 +161,40 @@ echo "  Expert curvature range: [${EXPERT_CURVATURE_MIN:-0.1}, ${EXPERT_CURVATUR
 echo "=============================================="
 
 # =============================================================================
-# Run Training in Apptainer
+# Run Training in Docker
 # =============================================================================
 
-# Combine all arguments into a single string
+# Combine all arguments into a single string for passing to docker
 ALL_ARGS="${MODEL_ARGS[*]} ${MOE_ARGS[*]} ${HYPERBOLIC_ARGS[*]} ${TRAINING_ARGS[*]}"
 
-# Build bind mounts
-BIND_MOUNTS="--bind ${MEGATRON_DIR}:/workspace/megatron"
-BIND_MOUNTS="${BIND_MOUNTS} --bind ${CHECKPOINT_DIR}:/workspace/checkpoints"
-BIND_MOUNTS="${BIND_MOUNTS} --bind ${TENSORBOARD_DIR}:/workspace/tensorboard"
-
-if [ -n "$HOST_DATA_DIR" ]; then
-    BIND_MOUNTS="${BIND_MOUNTS} --bind ${HOST_DATA_DIR}:/workspace/data"
-fi
-
-echo "Starting Lorentz MoE training in Apptainer..."
-
-apptainer exec --nv \
-    ${BIND_MOUNTS} \
-    --pwd /workspace/megatron \
-    "${APPTAINER_IMAGE}" \
-    bash -c "
-        export PYTHONPATH=/workspace/megatron:\${PYTHONPATH}
-
+docker run --rm \
+    --gpus all \
+    --ipc=host \
+    --ulimit memlock=-1 \
+    --ulimit stack=67108864 \
+    -v "${MEGATRON_DIR}:/workspace/megatron" \
+    -v "${CHECKPOINT_DIR}:/workspace/checkpoints" \
+    -v "${TENSORBOARD_DIR}:/workspace/tensorboard" \
+    ${DOCKER_DATA_MOUNT:-} \
+    -w /workspace/megatron \
+    -e GPUS_PER_NODE="$GPUS_PER_NODE" \
+    -e NUM_NODES="$NUM_NODES" \
+    -e NODE_RANK="$NODE_RANK" \
+    -e MASTER_ADDR="$MASTER_ADDR" \
+    -e MASTER_PORT="$MASTER_PORT" \
+    -e ALL_ARGS="$ALL_ARGS" \
+    "$DOCKER_IMAGE" \
+    bash -c '
+        echo "Starting Lorentz MoE training..."
         torchrun \
-            --nproc_per_node ${GPUS_PER_NODE} \
-            --nnodes ${NUM_NODES} \
-            --node_rank ${NODE_RANK} \
-            --master_addr ${MASTER_ADDR} \
-            --master_port ${MASTER_PORT} \
-            pretrain_lorentz_moe_gpt.py \
-            ${ALL_ARGS}
-    "
+            --nproc_per_node $GPUS_PER_NODE \
+            --nnodes $NUM_NODES \
+            --node_rank $NODE_RANK \
+            --master_addr $MASTER_ADDR \
+            --master_port $MASTER_PORT \
+            pretrain_lorentz_gpt.py \
+            $ALL_ARGS
+    '
 
 echo "=============================================="
 echo "Training completed!"

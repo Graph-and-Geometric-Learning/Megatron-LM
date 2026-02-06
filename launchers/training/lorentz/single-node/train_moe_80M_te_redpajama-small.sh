@@ -1,9 +1,8 @@
 #!/bin/bash
 # =============================================================================
-# Lorentz MoE GPT 80M: TEGroupedMLP Backend (Apptainer)
+# Lorentz MoE GPT 80M: TEGroupedMLP Backend
 # =============================================================================
 # Lorentz MoE training with TransformerEngine's efficient grouped linear.
-# Uses Apptainer for containerized execution (Slurm-compatible).
 #
 # Expert Type: LorentzTEGroupedMLP
 #   - True Lorentz geometry via tangent space approximation
@@ -22,10 +21,11 @@ set -e
 # =============================================================================
 # Data Configuration (RedPajama-Small)
 # =============================================================================
-export HOST_DATA_DIR="/fsx/ubuntu/users/aosong/data"
+HOST_DATA_DIR="/fsx/ubuntu/users/aosong/data"
 HOST_DATA_PATH="${HOST_DATA_DIR}/processed_data/redpajama_small/stackexchange_text_document"
 
 export DATA_PATH="/workspace/data/processed_data/redpajama_small/stackexchange_text_document"
+export DOCKER_DATA_MOUNT="-v ${HOST_DATA_DIR}:/workspace/data"
 
 # Validate data exists
 if [ ! -f "${HOST_DATA_PATH}.bin" ]; then
@@ -110,7 +110,7 @@ export PP=1
 export EP=1
 
 # =============================================================================
-# Run with Apptainer
+# Run
 # =============================================================================
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "${SCRIPT_DIR}/_train_moe_base_apptainer.sh"
+source "${SCRIPT_DIR}/../base/_train_moe_base_docker.sh"
